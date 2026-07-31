@@ -1,0 +1,96 @@
+# Modules that are not part of the Stage 1-6 pipeline.
+#
+# Each of these was a real step at the time it was written, and each was
+# superseded. None is imported by any pipeline module, and none is invoked by
+# any pipeline stage -- verified by import graph, not by reading docstrings.
+# The only surviving references to them are comments and docstrings.
+#
+# All six were untracked with `git rm --cached` on 2026-07-30 -- .gitignore
+# has no effect on a tracked file, so listing them here alone would have done
+# nothing. They remain on disk and their content remains in history at the
+# commits that introduced them; only the index entry is gone.
+#
+# To restore one to the index, delete its line below and:
+#
+#     git add -f <name>
+#
+# Deleting the working-tree copies is a separate decision and has not been
+# made -- see the retired-in-place convention in UPDATES.md.
+
+# --- Stage 2 exploratory crop work, all frame-0 only ----------------------
+# Superseded by build_id_images.py (Stage 3), which does the same geometry
+# across all 2000 frames in one composed warp.
+
+# "the minimal first step" -- axis-aligned boxes, no masking, no rescaling.
+make_boxes.py
+
+# "practice run" -- canonical-frame hull images. The sizing statistics it
+# worked out (median x-spread, mean y-length, median centroid height) live on
+# in config.py; the module itself does not.
+canonical_hulls.py
+
+# Stage 2 proper. UPDATES.md: "PLUMBING WORKS, IMAGE QUALITY DOES NOT". Its
+# own docstring flags pad=0 and dilate_iters=0 as placeholders -- "do not
+# build on these". Nothing does.
+crops.py
+
+# --- Stage 5, retired in place --------------------------------------------
+# Carries a "SLEAP-PORT: RETIRED -- NOT PART OF THE PIPELINE" banner and has
+# its __main__ commented out so it cannot be run as a stage by accident. The
+# readout is now the SLEAP GUI via build_sleap_tracks.py (Stage 6); nothing
+# consumes idtracker.ai's trajectories/ folder.
+build_trajectories.py
+
+# --- Reports on the retired modules ---------------------------------------
+# Frame-0 measurements describing crops.py and episodes.py as they stood in
+# Stage 1-2. UPDATES.md is the current record.
+_report_crops.md
+_report_episodes.md
+
+
+# ===========================================================================
+# Standalone-repo rules. This directory is now the repository root, so it
+# carries the rules the old parent root used to provide.
+# ===========================================================================
+
+# --- Reference forks ------------------------------------------------------
+# ~428 MB of unmodified upstream source, imported by nothing, kept only to read
+# the port against. Fully reproducible -- see PROVENANCE.md.
+vendor/
+
+# --- Experiment data ------------------------------------------------------
+# Not code. Point SLEAP_IDTRACKER_DATA at wherever yours lives; `data/` is the
+# default location and stays out of history at any size.
+data/
+*.mp4
+*.slp
+*.pkg.slp
+*.zip
+
+# --- Pipeline output ------------------------------------------------------
+# Written by the stages, reproducible by re-running them.
+session_*/
+crops/
+crops_frame0*/
+trajectories/
+*.log
+
+# --- Model checkpoints ----------------------------------------------------
+# Reproducible by retraining, and past GitHub's 50 MB warning. Git cannot
+# delta-compress them, so every version would be kept forever at full size.
+*.ckpt
+wandb/
+*.n=[0-9]*/
+
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# --- macOS ----------------------------------------------------------------
+.DS_Store

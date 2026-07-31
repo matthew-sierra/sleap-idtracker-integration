@@ -1,0 +1,5 @@
+color_action = "<qt>When checked, the video is shown in RGB color. Besides that, idtrackerai always processes the video in grayscale. Checking this may increase the RAM usage"
+
+framerate_action = "<qt>When checked, the video is played at the original framerate. When unchecked, the video is played at the maximum possible framerate"
+
+reducecache_action = "<qt>To improve user experience, the lasts displayed frames are cached in memory for faster access. This option allows to reduce the size of the cache to save memory. When this option is checked, the size of the cache goes from 128 frames to 16 frames."

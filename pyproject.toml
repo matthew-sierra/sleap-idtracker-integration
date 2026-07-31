@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sleap-idtracker"
+version = "0.1.0"
+description = "Port of idtracker.ai's identity assignment onto SLEAP pose predictions, without blobs or thresholding."
+readme = "README.md"
+# `itertools.pairwise` (episodes.py) and PEP 604 unions in annotations.
+requires-python = ">=3.10"
+
+# Bounds are the versions this pipeline was actually developed and validated
+# against, not aspirational ranges. Upper bounds are deliberately loose except
+# where a major bump is known to be breaking.
+dependencies = [
+    # --- ours ---------------------------------------------------------------
+    "sleap-io >=0.7.0,<0.8.0",   # the io package sleap 1.6.3 pins; reads .slp
+    "numpy >=1.26.4",
+    "scipy >=1.15.0",
+    "h5py >=3.10.0",
+    "pandas >=2.0",              # assignment_margin.py only
+    "torch >=2.0",               # ResNet18 contrastive forward pass, Stage 3h/4
+    "opencv-python-headless >=4.10.0.84",  # first release compatible with NumPy 2
+
+    # --- required by the idtracker.ai code paths this port actually calls ----
+    # Fragment / ListOfFragments / GlobalFragment / ListOfGlobalFragments /
+    # ContrastiveLearning / load_id_images. This is a subset of
+    # idtrackerai/pyproject.toml, not a copy of it.
+    "rich >=13.5.1",
+    "scikit-learn >=1.6.0",      # MiniBatchKMeans, via ContrastiveLearning
+    "matplotlib >=3.7.0",
+    "packaging",
+    "psutil >=6.1.0",
+    "requests >=2.26.0",
+    "toml >=0.10.2",
+    "deprecated >=1.2.13",
+]
+
+# NOT included, deliberately: pyqt6, qtpy, superqt. They are idtracker.ai's GUI
+# stack and nothing in this port opens a window. If you want to run upstream's
+# own interface against the bundled copy, install from idtrackerai/pyproject.toml
+# instead. episodes.py additionally stubs `toml` and `deprecated` at import time
+# (`_install_dependency_stubs`), so Stage 1 works even if those two are absent.
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+# The stages are run as scripts from a checkout:
+#
+#     python build_id_images.py
+#
+# They import each other by bare top-level name (`import config`), which works
+# because every stage puts its own directory on sys.path first. Installing those
+# names into site-packages would put `config`, `crops` and `episodes` in the
+# global namespace, where they would collide with anything else of that name --
+# so this project installs NO modules. `pip install -e .` exists purely to
+# resolve the dependency list above.
+[tool.setuptools]
+py-modules = []
