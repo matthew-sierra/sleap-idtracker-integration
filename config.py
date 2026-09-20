@@ -9,7 +9,7 @@ This module imports nothing from the rest of the pipeline, so it can be imported
 from anywhere without a cycle. Stage modules bind their old names to these
 values, so nothing else in them had to change:
 
-    from config import CROSSING_THRESHOLD    # build_id_images.py
+    from config import MAX_CROP_AREA         # build_id_images.py
 
 Values that are DERIVED rather than chosen -- the id-image size, the episode
 boundaries, the fragment count -- are not here. They are computed by the stage
@@ -110,7 +110,7 @@ IDTRACKER_SLP = SLP.parent / (
 # (list_of_global_fragments.py:221). If N_ANIMALS exceeds what is ever detected
 # at once, no frame qualifies and there are no global fragments -- which is a
 # supported outcome, handled by the k-means++ path in build_global_fragments.py.
-N_ANIMALS = 16
+N_ANIMALS = 2
 
 # How an individual fragment's identity is read off after prediction.
 #
@@ -152,21 +152,92 @@ FRAMES_PER_EPISODE = 500
 # directly above CENTROID_NODE, and CENTROID_NODE is the point rotated about --
 # so it is also the fixed point of the transform and the animal's origin.
 TOP_NODE = "head"
-CENTROID_NODE = "thorax"
+CENTROID_NODE = "torso"
+
+# Second choice for TOP_NODE, used ONLY when TOP_NODE is NaN on that instance.
+#
+# The alignment needs a point in FRONT of the centroid to measure a heading
+# from, and the pipeline's rule until now was all-or-nothing: if TOP_NODE was
+# missing the instance produced no id-image row at all (build_id_images
+# .collect_geometry -> rotation_matrix returns None -> n_skipped). On a skeleton
+# where the nose is the tip of the animal that is a real cost -- the nose is the
+# first thing SLEAP loses to occlusion, and the node just behind it is usually
+# still there and points the same way.
+#
+# Set to a node name to enable the fallback, or None to keep the old
+# all-or-nothing behaviour exactly. The fallback node must lie on the SAME body
+# axis as TOP_NODE (both in front of CENTROID_NODE), because a heading measured
+# from it has to mean the same thing as one measured from TOP_NODE -- the two
+# populate one id-image set and the network sees no marker saying which was
+# used. Substituting a node on a different axis would silently rotate part of
+# the population by a different amount.
+#
+# If BOTH are NaN the instance is skipped as before: no row, counted in
+# `n_no_alignment`. How many instances came in through the fallback is recorded
+# per episode as the `n_top_fallback` HDF5 attribute (and `n_top_fallback_total`
+# for the whole session), so a session is never silently part-aligned on one
+# node and part on another.
+TOP_NODE_FALLBACK = None
 
 # The "bottom" of the animal, used only to decide how high the centroid sits in
 # the canonical frame. NOTE: wingR is the lowest node in just 9/16 flies on frame
 # 0 -- the rest are bottomed by the left wing or a hindleg -- and being the RIGHT
 # wing makes it asymmetric under wing pose. Kept as specified.
-BOTTOM_NODE = "wingR"
+BOTTOM_NODE = "tail_base"
 
 # The animal's body outline, excluding limbs and wings. Legs and wings splay far
 # past the body, so a hull over every node reports contact long before the bodies
 # are anywhere near each other.
-BODY_NODES = ["head", "eyeL", "eyeR", "thorax", "abdomen"]
+BODY_NODES = ["head", "left_head", "right_head", "torso", "left_hip", "right_hip",
+              "tail_base"]
 
 # Padding around the rotated keypoint extent, in pixels (rotate_boxes.py).
 PAD = 0
+
+
+# ---------------------------------------------------------------------------
+# Colour mode  (build_id_images.py)
+# ---------------------------------------------------------------------------
+
+# Whether the source video is single-channel or three-channel colour. This is a
+# DECLARATION, not a request for a conversion: nothing here converts RGB to grey
+# or grey to RGB. It states what the frames are, and build_id_images.py checks
+# every frame against it and refuses to run if they disagree (see
+# rotate_boxes.check_frame). Getting this wrong is otherwise silent -- a colour
+# video read as grey would have two thirds of its pixels dropped by the squeeze
+# that used to be unconditional, and the identity network would train on the
+# result without complaint.
+#
+# "GRAYSCALE"  frames are (H, W) or (H, W, 1); id-images are (n, H, W) uint8.
+# "RGB"        frames are (H, W, 3);           id-images are (n, H, W, 3) uint8.
+#
+# The crop GEOMETRY is identical either way -- same H, same W, same rows, same
+# affine. RGB only widens each pixel from one uint8 slot to three, so an RGB
+# session's HDF5 files are 3x the bytes of the grayscale ones at exactly the
+# same image dimensions.
+#
+# NOTE ON SLEAP: sleap-io applies its own conversion before we ever see a frame.
+# If the .slp was built with `Video.grayscale = True` -- which is what SLEAP
+# does by default, and what every .slp in this repo has -- then `lf.image` comes
+# back (H, W, 1) no matter how colourful the underlying mp4 is. Selecting "RGB"
+# against such a file is a real misconfiguration and is reported as one: the
+# colour is not recoverable without rebuilding the .slp with grayscale off.
+#
+# Override without editing this file:
+#
+#     export SLEAP_IDTRACKER_COLOR_MODE=RGB
+#
+COLOR_MODE = (os.environ.get("SLEAP_IDTRACKER_COLOR_MODE") or "GRAYSCALE").upper()
+
+if COLOR_MODE not in ("GRAYSCALE", "RGB"):
+    raise ValueError(
+        f"COLOR_MODE must be 'GRAYSCALE' or 'RGB', got {COLOR_MODE!r}. "
+        "Set it in config.py or via SLEAP_IDTRACKER_COLOR_MODE."
+    )
+
+# Derived, not chosen -- kept here only because it is a pure restatement of the
+# line above and every stage that allocates an array needs it.
+N_CHANNELS = 3 if COLOR_MODE == "RGB" else 1
 
 
 # ---------------------------------------------------------------------------
@@ -196,35 +267,68 @@ SIZE_STAT = "median"
 MAX_CROP_AREA = 6400
 
 
+# SIMILARITY_METHOD choices:
+#   "bounding_box"  IoU of axis-aligned boxes over the keypoints. Fast, and what
+#                   SLEAP's own tracker uses -- but a box around a diagonal
+#                   animal is mostly background (39% animal on this data), so
+#                   two boxes can overlap heavily while the animals do not touch.
+#   "keypoint"      OKS. Robust to missing keypoints; averages over visible ones.
+#   "centroid"      exp(-distance / body_length). Position only, no shape.
+#   "hull"          TRUE IoU of the convex silhouettes: intersection area over
+#                   union area of the two hulls, computed with
+#                   cv2.intersectConvexConvex and inclusion-exclusion. Uses the
+#                   SAME hull the id-image was masked with -- surrounding
+#                   keypoints when all present, Graham scan over the survivors
+#                   otherwise -- so the polygon matched frame-to-frame is the
+#                   polygon the identity network was shown. Slower than the box
+#                   metric (a per-pair polygon clip rather than a vectorised
+#                   rectangle overlap), and worth it when animals pass close
+#                   enough that box overlap reports contact that never happens.
+
+
 # ---------------------------------------------------------------------------
-# Hull crossing detection  (build_id_images.py)  -- DIAGNOSTIC ONLY
+# Silhouette hull  (build_id_images.py)
 # ---------------------------------------------------------------------------
-# NOTE ON STATUS: this is the within-frame geometric test, and it does NOT decide
-# what the pipeline treats as a crossing. The `crossings` dataset it writes is
-# read by nothing downstream. The load-bearing determination is `is_overlapping`,
-# computed from the assignment cost matrix in build_overlaps.py -- see below.
-# These knobs are kept because the hull overlap is still a useful thing to
-# measure and report.
+
+# Which keypoints define the id-image silhouette, split by the role they play.
 #
-# An instance is flagged when its hull overlaps another instance's hull in the
-# same frame by more than CROSSING_THRESHOLD, measured by CROSSING_METRIC over
-# the nodes selected by CROSSING_NODES.
+# SURROUNDING_KEYPOINTS are the outline: the nodes that, in a well-predicted
+# instance, are the ones actually ON the convex hull. They are the default and
+# the fast path -- when all of them are present the hull is exactly these, and
+# no other node is even looked at.
 #
-# CROSSING_NODES: "body" -- hull of BODY_NODES only.  "all" -- hull of every node.
+# BOUNDED_KEYPOINTS are the nodes that normally sit strictly INSIDE that
+# outline, so including them changes nothing while the outline is intact. They
+# exist for the case where it is not: if any surrounding keypoint is missing the
+# outline has a hole in it, and the hull is rebuilt by Graham scan over every
+# keypoint still available, bounded and surrounding alike, so that the
+# silhouette stays as close to the animal's true extent as the surviving
+# evidence allows.
 #
-# CROSSING_METRIC:
-#   "iou"   -- intersection / union. Symmetric; the conventional choice.
-#   "iomin" -- intersection / area of the SMALLER hull. Use when one animal is
-#              much smaller, where IoU under-reports full occlusion of the small
-#              one. Not needed for same-species same-size subjects.
+# This replaces the previous behaviour of hulling every finite node
+# unconditionally, and it is NOT a no-op on complete instances. A node is only
+# "bounded" as often as the animal's pose keeps it inside; MEASURED on
+# mice_new.mp4, the torso lies ON the hull in 434/5404 complete instances (8%),
+# and excluding it there costs a median 25.7% of hull area (max 58.6%) -- a
+# bending mouse pushes its torso outside the line from its head nodes to its
+# hips. So changing these lists changes the silhouettes the identity network
+# trains on, and an existing session is not comparable to a new one without
+# rebuilding its id-images.
 #
-# CROSSING_THRESHOLD: measured on this dataset, full-hull IoU never exceeds
-# 0.0382 anywhere in 2000 frames and body-hull IoU is 0.0000 everywhere. See
-# UPDATES.md for the sweep. 0.05 sits above the full-hull noise floor with
-# headroom and is inert for body hulls.
-CROSSING_NODES = "body"
-CROSSING_METRIC = "iou"
-CROSSING_THRESHOLD = 0.05
+# To reproduce the old behaviour exactly, put EVERY node in
+# SURROUNDING_KEYPOINTS and leave BOUNDED_KEYPOINTS empty: the primary path then
+# hulls all nodes, and any missing one sends it to the fallback, which also
+# hulls all surviving nodes.
+#
+# Defaults below are the mouse skeleton with the torso treated as interior.
+# That is a choice about this animal, not a fact about it -- see the measurement
+# above before keeping it. Every name must exist in the .slp's skeleton.
+SURROUNDING_KEYPOINTS = ["head", "left_head", "right_head",
+                         "left_hip", "right_hip", "tail_base"]
+
+BOUNDED_KEYPOINTS = ["torso"]
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +348,7 @@ CROSSING_THRESHOLD = 0.05
 #
 # OVERLAP_NODES: which keypoints define the bounding box.
 #   "all"  -- every node, which is what SLEAP's own tracker uses.
-#   "body" -- BODY_NODES only, matching CROSSING_NODES. Legs and wings splay, so
+#   "body" -- BODY_NODES only. Legs and wings splay, so
 #             full-pose boxes are larger and overlap sooner.
 #
 # OVERLAP_DIRECTION: which links have to be unambiguous for an instance to
@@ -258,19 +362,40 @@ CROSSING_THRESHOLD = 0.05
 #
 # GAP_SCALE: what the threshold is measured against. This matters more than it
 #   looks, because the two options are on different scales.
-#   "per_edge" -- divide the total cost increase by the number of animals whose
-#                 partner changed. Units are then "mean IoU given up per
-#                 re-assigned animal", i.e. the [0, 1] scale IoU itself lives on,
-#                 which is the scale SIMILARITY_THRESHOLD is quoted in.
-#   "total"    -- the raw increase in total assignment cost. Because a
-#                 permutation can never change just one pairing (the difference
-#                 between two permutations is a cycle of length >= 2), the
-#                 smallest possible change touches two edges and this quantity
-#                 sits on roughly [0, 2]. A threshold of 0.3 here is ~6x
-#                 stricter than the same number under "per_edge".
-#   "per_edge" also handles long cycles correctly: 16 animals each shifting one
-#   place is genuinely ambiguous, and per-animal cost catches it where a large
-#   total would not.
+#   "total"    -- (DEFAULT, user-specified) the raw increase in total assignment
+#                 cost, i.e. an instance is in a crossing when the SECOND-BEST
+#                 assignment costs within SIMILARITY_THRESHOLD of the best one.
+#                 Because a permutation can never change just one pairing (the
+#                 difference between two permutations is a cycle of length >= 2),
+#                 the smallest possible change touches two edges and this
+#                 quantity sits on roughly [0, 2].
+#   "per_edge" -- divide that increase by the number of animals whose partner
+#                 changed. Units are then "mean IoU given up per re-assigned
+#                 animal". It catches long cycles that "total" misses: 16 animals
+#                 each shifting one place is genuinely ambiguous, and has a large
+#                 total but a small per-animal cost.
+#
+# WHY "total" IS THE DEFAULT -- MEASURED on Pletcher_10fly (18000 frames, 10
+# flies, 149342 id-image rows). "per_edge" divides by the number of animals whose
+# partner changed, which counts animals whose change cost NOTHING. When a
+# detection drops out, the matrix gains a padding column at UNMATCHED_COST and
+# the orphaned row's costs are then all 1.0 -- identical to any zero-IoU pair --
+# so moving it is free. The cheapest alternative becomes "the moving animal goes
+# unmatched, the orphan takes its column", whose entire cost is the IoU the
+# moving animal forfeits. n_changed is 2 but only ONE edge pays, so per_edge
+# halves the margin and reports IoU/2. The effective rule degenerates to "flag
+# any instance whose successor IoU < 2 * threshold", which fires on isolated,
+# cleanly tracked animals with no competitor anywhere near them. 15.52% of frame
+# transitions on that clip have unequal counts and so open such a slot.
+#
+# Switching to "total" there, at the same threshold:
+#     fragments                            6980 -> 3888   (-44%)
+#     instances stranded in fragments < 4  6752 -> 3144   (-53%)
+#     is_overlapping flagged              4.27% -> 1.81%
+#
+# The trade is that "total" is uniformly more permissive and gives up the
+# long-cycle protection above. On a clip where animals genuinely cross, confirm
+# real encounters are still flagged before trusting it.
 #
 # SET TO 0.80 DELIBERATELY, NOT 0.3. On this clip the smallest per-edge gap
 # found anywhere is 0.7856 (p1 = 0.8743), so the original 0.3 flags nothing at
@@ -293,7 +418,7 @@ CROSSING_THRESHOLD = 0.05
 # has to stay finite and non-negative against UNMATCHED_COST padding. Upstream's
 # euclidean scorer returns a raw negative distance and could not be used as-is;
 # see centroid_matrix for the mapping and why the scale is the body length.
-SIMILARITY_METHOD = "bounding_box"
+SIMILARITY_METHOD = "bounding_box"   # bbox IoU
 
 # One threshold per method, because the three do NOT share a scale -- the same
 # number means a different thing under each, and a single shared value would be
@@ -308,6 +433,11 @@ SIMILARITY_METHOD = "bounding_box"
 #     keypoint       min gap 0.5820   median 0.9110
 #     centroid       min gap 0.4908   median 0.8482
 #
+# NOTE: those minima were measured under GAP_SCALE = "per_edge". The default is
+# now "total", on which the same alternatives score n_changed times higher
+# (n_changed >= 2), so the figures above are lower bounds -- re-run the sweep
+# build_overlaps.py prints before tuning any of these.
+#
 # So at 0.2 every method flags nothing on this clip -- 0/32000 for all three --
 # and the crossing machinery downstream never runs. That is a deliberate choice
 # to leave them low for now, not an oversight. Note the three minima differ by
@@ -319,14 +449,42 @@ SIMILARITY_METHOD = "bounding_box"
 # re-running build_overlaps.py at 0.2 would collapse 19 fragments to 16 and
 # remove the crossing fragment the crossing-identity path is tested on.
 SIMILARITY_THRESHOLD = {
-    "bounding_box": 0.2,
+    "bounding_box": 0.3,
     "keypoint": 0.2,
     "centroid": 0.2,
+    # "hull" lives on a DIFFERENT scale from "bounding_box" even though both are
+    # IoU: a hull is ~40-60% of its own bounding box on this data (measured on
+    # mice_new: 23652 px box vs 9202 px hull), so the same pair of animals scores
+    # markedly lower here than on boxes. Start from the bbox value and re-tune
+    # against the per-edge gap sweep build_overlaps prints; a threshold below the
+    # method's minimum observed gap flags nothing at all.
+    "hull": 0.3,
 }
+# NEIGHBOUR_RADIUS: spatial gate on the frame-to-frame cost matrix. Only pairs
+# whose CENTROID_NODE positions lie within NEIGHBOUR_RADIUS * body_length of one
+# another are scored; every other cell is set to similarity 0, i.e. cost 1.0 ==
+# UNMATCHED_COST. Set to None to score all pairs.
+#
+# For the IoU-style metrics this is exact, not an approximation: two shapes
+# whose centroids are further apart than their own extent cannot overlap, so the
+# skipped cells were going to be 0 anyway. It removes the work, not the answer.
+#
+# For "centroid" it is NOT exact. exp(-d / body_length) is 0.368 at exactly one
+# body length and never reaches 0, so a gate at 1.0 truncates a similarity the
+# metric considers meaningful. Raise the radius (3.0 puts the truncation at
+# 0.050) or set it to None if you are matching on centroids over long jumps.
+# "keypoint" (OKS) decays on the scale of the animal itself and is ~0 by one
+# body length, so the gate is effectively exact there too.
+#
+# The radius is in BODY LENGTHS, read from the id-image `body_length` attribute
+# -- the same measured quantity the crops were sized with -- so it transfers
+# between datasets without retuning.
+NEIGHBOUR_RADIUS = 1.0
+
 OVERLAP_NODES = "all"
 OVERLAP_DIRECTION = "both"
 MAX_FRAME_GAP = 1
-GAP_SCALE = "per_edge"
+GAP_SCALE = "total"
 
 # Cost charged for leaving an instance unpaired. 1.0 == the cost of a real pair
 # at IoU 0, so padding is never preferred over a genuine (if poor) match.

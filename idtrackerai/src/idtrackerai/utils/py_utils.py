@@ -413,6 +413,45 @@ class H5DatasetProxy:
         self.dataset = None
 
 
+def nchw_grayscale(images) -> "torch.Tensor":
+    """SLEAP-PORT: (n, H, W) -> (n, 1, H, W). The grayscale id-image layout.
+
+    Identical to the ``.unsqueeze(1)`` every call site used to carry inline.
+    """
+    import torch
+
+    t = images if isinstance(images, torch.Tensor) else torch.from_numpy(images)
+    return t.unsqueeze(1)
+
+
+def nchw_rgb(images) -> "torch.Tensor":
+    """SLEAP-PORT: (n, H, W, 3) -> (n, 3, H, W). The RGB id-image layout.
+
+    The channel axis already exists here, in the position numpy/HDF5 put it and
+    the wrong one for Conv2d, so it is moved rather than inserted. ``unsqueeze``
+    on this input would yield a 5-D tensor.
+    """
+    import torch
+
+    t = images if isinstance(images, torch.Tensor) else torch.from_numpy(images)
+    return t.permute(0, 3, 1, 2).contiguous()
+
+
+def nchw_for(n_channels: int):
+    """SLEAP-PORT: pick the layout function for a session, ONCE.
+
+    A session's id-images are all one shape -- the colour mode is declared up
+    front and build_id_images.py refuses to write a file that disagrees -- so
+    the choice is made here, at setup, and the chosen function contains no
+    branch at all. Callers hold the function, not the channel count.
+    """
+    if n_channels == 1:
+        return nchw_grayscale
+    if n_channels == 3:
+        return nchw_rgb
+    raise ValueError(f"unsupported id-image channel count {n_channels!r}; expected 1 or 3")
+
+
 def load_id_images(
     images_sources: Sequence[Path | str | h5py.Dataset | np.ndarray | H5DatasetProxy],
     images_indices: Sequence[tuple[int, int]] | np.ndarray,
