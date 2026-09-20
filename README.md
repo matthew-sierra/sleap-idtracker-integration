@@ -35,8 +35,10 @@ predictions/<your>.predictions.slp     # SLEAP output    -> SLEAP_IDTRACKER_SLP
 session_fourfly/                       # written by the pipeline -> SLEAP_IDTRACKER_SESSION
 ```
 
-Then set the population in `config.py` — `N_ANIMALS` is the number of animals in the arena, and
-`CENTROID_NODE` / `TOP_NODE` are the two skeleton nodes used to orient each crop.
+Then configure `config.py` for your dataset — see
+[Configuration](#configuration) below. At minimum you must set `N_ANIMALS` and the skeleton node
+names, because the defaults describe a different animal and the pipeline will not run against your
+skeleton without them.
 
 ## Run
 
@@ -75,12 +77,79 @@ In order to run the program, we assume that the individual already has a file th
 
 ### Required User Inputs
 
-All of the inputs are saved in `config.py`
+Everything is in `config.py`. Values below are the shipped defaults, which describe a 7-node mouse
+skeleton — **they will not match your data.** Each setting notes what breaks if it is wrong.
 
-1. Key nodes (`TOP_NODE`, `BOTTOM_NODE`, `CENTROID_NODE`)
-2. Similarity threshold (`SIMILARITY_THRESHOLD`) in between instances (typically, around 0.3 should suffice)
-3. Similarity method: `"iou", "keypoint", "centroid"
-4. Number of animals (`N_ANIMALS`)
+#### 1. Must set — these describe your dataset
+
+| setting | default | what it does |
+|---|---|---|
+| `N_ANIMALS` | `2` | Number of animals. Also a hard ceiling: preflight **aborts** and lists the offending frames (1-based) if any frame holds more instances than this. |
+| `TOP_NODE` | `"head"` | The node that ends up pointing up after rotation. **If it is NaN on an instance, that instance gets no crop, no id-image row, and no identity** — so pick a node your detector rarely misses. |
+| `TOP_NODE_FALLBACK` | `None` | Second choice when `TOP_NODE` is NaN. Worth setting: on a 5-mouse dataset `Nose` was missing on 5.85% of instances, and falling back to `Head` cut the unusable fraction from 5.80% to 1.12%. |
+| `CENTROID_NODE` | `"torso"` | Rotation origin, the `centroid` column in the HDF5, and the reference for the neighbour gate. Should be a reliably-detected, central node. |
+| `BOTTOM_NODE` | `"tail_base"` | Together with `TOP_NODE`, defines the body length used to size crops and scale `NEIGHBOUR_RADIUS`. |
+| `SURROUNDING_KEYPOINTS` | 6 mouse nodes | The outline nodes that form the crop mask by default. |
+| `BOUNDED_KEYPOINTS` | `["torso"]` | Nodes normally *inside* the outline. They join the hull only in the Graham-scan fallback, used when a surrounding node is missing. |
+| `BODY_NODES` | 8 mouse nodes | Used only when `OVERLAP_NODES = "body"`. Must name real nodes regardless, or imports fail. |
+| `COLOR_MODE` | `"GRAYSCALE"` | `"GRAYSCALE"` or `"RGB"`; also settable via `SLEAP_IDTRACKER_COLOR_MODE`. Declared, **not** detected — every frame is checked against it and a mismatch aborts the session. |
+
+Node names are matched exactly, including case.
+
+#### 2. Should review — tuning
+
+| setting | default | notes |
+|---|---|---|
+| `SIMILARITY_METHOD` | `"bounding_box"` | One of `"bounding_box"`, `"keypoint"` (OKS), `"centroid"`, `"hull"` (true polygon IoU). |
+| `SIMILARITY_THRESHOLD` | dict, see below | **A dict keyed by method, not a scalar** — the four metrics do not share a scale. |
+| `NEIGHBOUR_RADIUS` | `1.0` | Spatial gate on the cost matrix, in body lengths; `None` disables. Exact for `bounding_box` and `hull` (shapes further apart than their own extent cannot overlap). **Not exact for `centroid`**, whose score is still 0.368 at one body length — raise to ~3.0 or disable if matching on centroids. |
+| `MAX_CROP_AREA` | `6400` | Upper bound on id-image area in pixels. Crops above it are scaled down, which shrinks what the identity network sees — on one mouse dataset native 97×187 crops were reduced to 57×111. Check the printed clamp line. |
+| `GAP_SCALE` | `"total"` | `"total"`: an instance is in a crossing when the second-best assignment is within `SIMILARITY_THRESHOLD` of the best. `"per_edge"` divides by the number of re-partnered animals and is not recommended — it counts animals whose change cost nothing, and flags isolated, cleanly-tracked animals whenever a detection drops out. |
+| `MIN_N_FRAMES_TO_BE_A_CANDIDATE_FOR_ACCUMULATION` | `4` | Fragments shorter than this are never predicted on and come out unassigned (identity 0). |
+| `OVERLAP_NODES` | `"all"` | `"all"` or `"body"` (i.e. `BODY_NODES`) for the frame-to-frame comparison. |
+| `OVERLAP_DIRECTION` | `"both"` | `"both"`, `"forward"`, or `"backward"`. |
+| `MAX_FRAME_GAP` | `1` | Frames further apart than this are treated as having no neighbour. |
+| `FRAMES_PER_EPISODE` | `500` | HDF5 shard size. Affects file count and memory, not results. |
+| `USE_P2_ASSIGNMENT` | `True` | Run the P2 coexistence cascade. With `False`, identity is plain `argmax(P1)` per fragment. |
+| `SIZE_STAT`, `PAD` | `"median"`, `0` | Crop sizing statistic and padding. |
+
+`SIMILARITY_THRESHOLD` ships as:
+
+```python
+SIMILARITY_THRESHOLD = {
+    "bounding_box": 0.3,
+    "keypoint":     0.2,
+    "centroid":     0.2,
+    "hull":         0.3,
+}
+```
+
+Only the entry for the active `SIMILARITY_METHOD` is read. A threshold below the smallest gap your
+data actually produces flags nothing at all, so check the gap sweep `build_overlaps.py` prints
+before trusting a value — the right number is dataset-dependent and the shipped ones were measured
+elsewhere.
+
+#### 3. Leave alone unless you know why
+
+`N_CHANNELS` is derived from `COLOR_MODE`. `UNMATCHED_COST`, `REPORT_CEILING`, `TIE_TOL` and `SWEEP`
+are solver internals; `REPORT_CEILING` only widens the range of exactly-reported gaps and, under
+`GAP_SCALE = "total"`, a high value disables the pruning that keeps the assignment search fast.
+
+#### 4. Paths — environment variables, not `config.py`
+
+```bash
+export SLEAP_IDTRACKER_DATA=/path/to/experiment     # data root
+export SLEAP_IDTRACKER_SLP=/path/to/input.predictions.slp
+export SLEAP_IDTRACKER_SESSION=/path/to/session_dir # pipeline output
+export SLEAP_IDTRACKER_COLOR_MODE=RGB               # optional
+```
+
+#### Before a long run
+
+`build_id_images.py` runs a preflight that aborts on more instances than `N_ANIMALS` in a frame, or
+too few keypoints to build any crop. It then prints the chosen crop size, whether the area clamp
+engaged, and how many instances were skipped for a missing alignment node. Those four numbers tell
+you whether the configuration is right before you spend GPU time on it.
 ### 1. Episode segmentation
 
 Handled by `episodes.py`
