@@ -35,8 +35,10 @@ predictions/<your>.predictions.slp     # SLEAP output    -> SLEAP_IDTRACKER_SLP
 session_fourfly/                       # written by the pipeline -> SLEAP_IDTRACKER_SESSION
 ```
 
-Then set the population in `config.py` — `N_ANIMALS` is the number of animals in the arena, and
-`CENTROID_NODE` / `TOP_NODE` are the two skeleton nodes used to orient each crop.
+Then configure `config.py` for your dataset — see
+[Configuration](#configuration) below. At minimum you must set `N_ANIMALS` and the skeleton node
+names, because the defaults describe a different animal and the pipeline will not run against your
+skeleton without them.
 
 ## Run
 
@@ -75,12 +77,78 @@ In order to run the program, we assume that the individual already has a file th
 
 ### Required User Inputs
 
-All of the inputs are saved in `config.py`
+Everything is in `config.py`. The shipped defaults describe a 7-node mouse skeleton — **they will
+not match your data.** Each entry below says what you need to know about *your* animals and video in
+order to fill it in.
 
-1. Key nodes (`TOP_NODE`, `BOTTOM_NODE`, `CENTROID_NODE`)
-2. Similarity threshold (`SIMILARITY_THRESHOLD`) in between instances (typically, around 0.3 should suffice)
-3. Similarity method: `"iou", "keypoint", "centroid"
-4. Number of animals (`N_ANIMALS`)
+#### 1. Must set — what you are tracking
+
+| setting | what to provide |
+|---|---|
+| `N_ANIMALS` | How many animals are in the arena. Must be exact: the run stops if any frame contains more detections than this. |
+| `TOP_NODE` | The node at the front of the animal — the one that should end up pointing upward once every crop is rotated to a common heading. Usually the head, nose or snout. Choose a node your detector rarely misses: an instance without it is dropped entirely and gets no identity. |
+| `TOP_NODE_FALLBACK` | A second front-of-animal node to use when `TOP_NODE` is missing on an instance. Leave `None` if you have no sensible alternative, but setting one recovers a lot of otherwise-discarded animals. |
+| `CENTROID_NODE` | The node at the animal's centre of mass — the point each crop is rotated around and the position used to track it through the arena. Usually the thorax, torso or trunk. Should be the most reliably detected node you have. |
+| `BOTTOM_NODE` | The node at the rear of the animal, opposite `TOP_NODE`. The distance between the two defines the animal's body length, which sets crop size and the search radius. Usually the tail base or abdomen. |
+| `SURROUNDING_KEYPOINTS` | The nodes that trace the animal's **outline** — those on its silhouette when seen from the camera. Ears, shoulders, hips, tail base. These are joined into the shape that is cut out of the frame as the animal's image. |
+| `BOUNDED_KEYPOINTS` | The nodes that normally sit **inside** that outline, such as the neck or trunk. Listing them here says "expected to be interior"; they are only brought into the outline when one of the surrounding nodes is missing. |
+| `BODY_NODES` | The nodes making up the animal's core body, excluding extremities that splay out unpredictably — legs, wings, tail tip. Only used if you set `OVERLAP_NODES = "body"`, but must name real nodes either way. |
+| `COLOR_MODE` | Whether your video is `"GRAYSCALE"` or `"RGB"`. State it correctly: this is declared, not detected, and a mismatch stops the run rather than guessing. |
+
+Node names must match your SLEAP skeleton exactly, including capitalisation.
+
+#### 2. Should review — how animals are matched between frames
+
+| setting | what to provide |
+|---|---|
+| `SIMILARITY_METHOD` | How to judge that a detection in one frame is the same animal as one in the next. `"bounding_box"` compares the boxes around them; `"hull"` compares their actual outlines; `"keypoint"` compares pose similarity; `"centroid"` compares distance moved. Outlines are the strictest, boxes the most forgiving. |
+| `SIMILARITY_THRESHOLD` | How close a competing match has to be before the pipeline treats the two animals as confusable and refuses to carry identity across. One value per method, since the four are not on the same scale. If nothing is ever flagged, your value is below anything your data produces — `build_overlaps.py` prints the range it actually saw. |
+| `NEIGHBOUR_RADIUS` | How far an animal can plausibly travel between consecutive frames, in body lengths. Anything further apart is not considered a possible match. `1.0` suits animals that move less than their own length per frame; raise it for fast animals or low frame rates, or set `None` to compare everything. |
+| `MAX_CROP_AREA` | The largest image, in pixels, that the identity network should see. Crops bigger than this are scaled down, so a small value costs visual detail — check the size the run reports and whether it says the clamp engaged. |
+| `MIN_N_FRAMES_TO_BE_A_CANDIDATE_FOR_ACCUMULATION` | The shortest run of consecutive frames worth trying to identify. Anything shorter is left unidentified rather than guessed at. |
+| `OVERLAP_NODES` | Which nodes to use when comparing animals between frames: `"all"` of them, or just `"body"` (your `BODY_NODES`). Use `"body"` if your animal has limbs or wings that move independently of the body. |
+| `MAX_FRAME_GAP` | How many frames apart two detections can be and still be linked. `1` means consecutive frames only. |
+| `OVERLAP_DIRECTION` | Whether to judge each detection by the link into it, out of it, or `"both"`. `"both"` is the cautious choice. |
+| `GAP_SCALE` | How the margin between the best and second-best match is measured. Leave at `"total"`; `"per_edge"` divides that margin by the number of animals involved and will flag isolated, cleanly-tracked animals whenever a detection drops out. |
+| `FRAMES_PER_EPISODE` | How many frames go into each intermediate file. Affects file count and memory use, not results. |
+| `USE_P2_ASSIGNMENT` | Whether to let animals visible at the same time rule each other out when assigning identities. Normally `True`. |
+| `SIZE_STAT`, `PAD` | How crop dimensions are chosen across the population, and how much margin to leave around each animal. |
+
+`SIMILARITY_THRESHOLD` ships as:
+
+```python
+SIMILARITY_THRESHOLD = {
+    "bounding_box": 0.3,
+    "keypoint":     0.2,
+    "centroid":     0.2,
+    "hull":         0.3,
+}
+```
+
+Only the entry matching your `SIMILARITY_METHOD` is used. These numbers were measured on other
+datasets — treat them as starting points, not defaults that will suit your animals.
+
+#### 3. Leave alone unless you know why
+
+`N_CHANNELS` is derived from `COLOR_MODE`. `UNMATCHED_COST`, `REPORT_CEILING`, `TIE_TOL` and `SWEEP`
+are solver internals; `REPORT_CEILING` only widens the range of exactly-reported gaps and, under
+`GAP_SCALE = "total"`, a high value disables the pruning that keeps the assignment search fast.
+
+#### 4. Paths — environment variables, not `config.py`
+
+```bash
+export SLEAP_IDTRACKER_DATA=/path/to/experiment     # data root
+export SLEAP_IDTRACKER_SLP=/path/to/input.predictions.slp
+export SLEAP_IDTRACKER_SESSION=/path/to/session_dir # pipeline output
+export SLEAP_IDTRACKER_COLOR_MODE=RGB               # optional
+```
+
+#### Before a long run
+
+`build_id_images.py` runs a preflight that aborts on more instances than `N_ANIMALS` in a frame, or
+too few keypoints to build any crop. It then prints the chosen crop size, whether the area clamp
+engaged, and how many instances were skipped for a missing alignment node. Those four numbers tell
+you whether the configuration is right before you spend GPU time on it.
 ### 1. Episode segmentation
 
 Handled by `episodes.py`
