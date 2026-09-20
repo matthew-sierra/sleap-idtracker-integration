@@ -48,8 +48,80 @@ OUT = REPO / "crops_frame0_rotated"
 
 # The two alignment keypoints, and the crop padding. Set in config.py.
 TOP_NODE = config.TOP_NODE          # ends up pointing up
+TOP_NODE_FALLBACK = config.TOP_NODE_FALLBACK  # used only when TOP_NODE is NaN
 CENTROID_NODE = config.CENTROID_NODE  # the origin we rotate about
 PAD = config.PAD
+COLOR_MODE = config.COLOR_MODE
+N_CHANNELS = config.N_CHANNELS
+
+
+class ColorModeError(ValueError):
+    """config.COLOR_MODE disagrees with the frames actually being read."""
+
+
+def _where(frame_idx, source) -> str:
+    """Message prefix. Only ever built on the error path."""
+    if frame_idx is None:
+        return ""
+    at = f"frame {frame_idx}"
+    if source is not None:
+        at += f" of {source}"
+    return at + ": "
+
+
+def _n_channels(image) -> int:
+    """Channel count, for reporting a mismatch. Error path only."""
+    if image.ndim == 2:
+        return 1
+    if image.ndim == 3:
+        return int(image.shape[2])
+    return -1
+
+
+def check_frame_grayscale(image, frame_idx=None, source=None):
+    """(H, W) or (H, W, 1) -> (H, W). Bound to `check_frame` under GRAYSCALE.
+
+    sleap-io hands back (H, W, 1) when Video.grayscale is set and (H, W) when it
+    is not, so both are accepted and the trailing axis is dropped -- exactly the
+    squeeze this replaced.
+    """
+    if image.ndim == 3:
+        if image.shape[2] == 1:
+            return image[:, :, 0]
+    elif image.ndim == 2:
+        return image
+    raise ColorModeError(
+        f"{_where(frame_idx, source)}COLOR_MODE is 'GRAYSCALE' but this frame "
+        f"has {_n_channels(image)} channels (shape {image.shape}) -- RGB video "
+        "was provided.\n"
+        "  Set COLOR_MODE = \"RGB\" in config.py, or export "
+        "SLEAP_IDTRACKER_COLOR_MODE=RGB, to keep the colour."
+    )
+
+
+def check_frame_rgb(image, frame_idx=None, source=None):
+    """(H, W, 3) -> unchanged. Bound to `check_frame` under RGB."""
+    if image.ndim == 3 and image.shape[2] == 3:
+        return image
+    found = _n_channels(image)
+    raise ColorModeError(
+        f"{_where(frame_idx, source)}COLOR_MODE is 'RGB' but this frame has "
+        f"{found} channel{'' if found == 1 else 's'} (shape {image.shape}) -- "
+        "grayscale video was provided.\n"
+        "  Set COLOR_MODE = \"GRAYSCALE\" in config.py, or export "
+        "SLEAP_IDTRACKER_COLOR_MODE=GRAYSCALE.\n"
+        "  If the source mp4 really is colour, the .slp is what flattened it: "
+        "sleap-io honours Video.grayscale, which SLEAP sets True by default. "
+        "Re-export the predictions with grayscale off to recover the channels."
+    )
+
+
+# Bound ONCE, at import, from the declared mode -- not re-derived per frame. A
+# video is entirely one thing or entirely the other, so which branch applies is
+# known before the first frame is read; only *whether the frames agree with it*
+# is a per-frame question, and that is all the chosen function asks. Callers say
+# `check_frame(...)` and get the block for their mode with no dispatch in it.
+check_frame = check_frame_grayscale if COLOR_MODE == "GRAYSCALE" else check_frame_rgb
 
 
 def node_xy(inst, name):
@@ -88,12 +160,31 @@ def heading_angle_deg(top_xy, centroid_xy):
     return float(np.degrees(np.arctan2(dx, -dy)))
 
 
-def rotate_instance(image, inst, top_name=TOP_NODE, centroid_name=CENTROID_NODE, pad=PAD):
+def top_node_xy(inst, top_name=TOP_NODE, fallback_name=TOP_NODE_FALLBACK):
+    """(x, y) of the alignment node, falling back to `fallback_name` when NaN.
+
+    Returns (xy, used_fallback), or (None, False) when neither node is usable.
+    `fallback_name` of None reproduces the old single-node behaviour exactly --
+    the second lookup is not even attempted. See config.TOP_NODE_FALLBACK for
+    why the fallback must sit on the same body axis as the primary.
+    """
+    xy = node_xy(inst, top_name)
+    if xy is not None:
+        return xy, False
+    if fallback_name is None:
+        return None, False
+    xy = node_xy(inst, fallback_name)
+    return (xy, True) if xy is not None else (None, False)
+
+
+def rotate_instance(image, inst, top_name=TOP_NODE, centroid_name=CENTROID_NODE, pad=PAD,
+                    fallback_name=TOP_NODE_FALLBACK):
     """Rotate `image` so the animal is upright; return (crop, angle, n_points).
 
-    Returns (None, None, 0) if either alignment keypoint is missing.
+    Returns (None, None, 0) if the centroid keypoint is missing, or if BOTH the
+    top node and its configured fallback are.
     """
-    top_xy = node_xy(inst, top_name)
+    top_xy, _used_fallback = top_node_xy(inst, top_name, fallback_name)
     centroid_xy = node_xy(inst, centroid_name)
     if top_xy is None or centroid_xy is None:
         return None, None, 0
@@ -126,12 +217,32 @@ def rotate_instance(image, inst, top_name=TOP_NODE, centroid_name=CENTROID_NODE,
     return rotated[y0:y1, x0:x1], angle, len(pts)
 
 
+def imwrite(path, img):
+    """cv2.imwrite, but with our channel order.
+
+    Frames arrive from sleap-io as RGB; cv2 writes the first channel to the blue
+    plane. Writing a colour crop straight out therefore swaps red and blue and
+    the diagnostic sheet -- whose only purpose is being looked at -- comes out
+    wrong. Grayscale is passed through untouched.
+    """
+    if img.ndim == 3 and img.shape[2] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    return cv2.imwrite(str(path), img)
+
+
 def montage(crops, cols=4, gap=6, bg=255):
-    """Contact sheet of the crops, padded to a common cell. Viewing aid only."""
+    """Contact sheet of the crops, padded to a common cell. Viewing aid only.
+
+    Works for (H, W) and (H, W, 3) crops alike: the cell grid is computed from
+    the leading two axes and any trailing channel axis is carried through to the
+    sheet, so a colour crop tiles exactly as a grey one does.
+    """
     ch = max(c.shape[0] for c in crops)
     cw = max(c.shape[1] for c in crops)
+    tail = crops[0].shape[2:]          # () grayscale, (3,) RGB
     rows = int(np.ceil(len(crops) / cols))
-    sheet = np.full((rows * (ch + gap) + gap, cols * (cw + gap) + gap), bg, np.uint8)
+    sheet = np.full((rows * (ch + gap) + gap, cols * (cw + gap) + gap, *tail),
+                    bg, np.uint8)
     for i, c in enumerate(crops):
         r, k = divmod(i, cols)
         y = gap + r * (ch + gap) + (ch - c.shape[0]) // 2
@@ -143,16 +254,16 @@ def montage(crops, cols=4, gap=6, bg=255):
 def main(frame_idx=0):
     labels = sio.load_slp(str(SLP))
     lf = labels[frame_idx]
-    image = lf.image
-    if image.ndim == 3 and image.shape[2] == 1:
-        image = image[:, :, 0]
+    image = check_frame(lf.image, lf.frame_idx, Path(SLP).name)
 
     OUT.mkdir(exist_ok=True)
     for f in OUT.glob("*.png"):
         f.unlink()
 
     print(f"frame {lf.frame_idx}: {len(lf.instances)} instances")
-    print(f"aligning {CENTROID_NODE!r} -> {TOP_NODE!r} onto the +y axis\n")
+    print(f"aligning {CENTROID_NODE!r} -> {TOP_NODE!r} onto the +y axis"
+          + (f" (fallback {TOP_NODE_FALLBACK!r} when {TOP_NODE!r} is NaN)"
+             if TOP_NODE_FALLBACK else "") + "\n")
     print(" inst   angle   width  height   file")
     print("-" * 46)
 
@@ -164,12 +275,12 @@ def main(frame_idx=0):
             print(f" {i:>4}      --      --      --   SKIPPED ({reason})")
             continue
         name = f"fly{i:02d}.png"
-        cv2.imwrite(str(OUT / name), crop)
+        imwrite(OUT / name, crop)
         crops.append(crop)
         print(f" {i:>4}  {angle:>6.1f}   {crop.shape[1]:>5}   {crop.shape[0]:>5}   {name}")
         written += 1
 
-    cv2.imwrite(str(OUT / "_montage.png"), montage(crops))
+    imwrite(OUT / "_montage.png", montage(crops))
     print("-" * 46)
     print(f"wrote {written}/{len(lf.instances)} rotated crops to {OUT}")
     print("contact sheet: _montage.png")

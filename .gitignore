@@ -94,3 +94,33 @@ venv/
 
 # --- macOS ----------------------------------------------------------------
 .DS_Store
+
+# --- Data, run outputs and model weights: never versioned ----------------
+# The parent working tree carries crops, predictions, session directories and
+# SLEAP model folders alongside this code. None of it belongs in the repo --
+# it is regenerable, large, and binary. Listed here so `git add -A` in this
+# directory cannot sweep it in (which is exactly how 106 binary files were
+# accidentally staged once).
+*.slp
+*.mp4
+*.h5
+*.pt
+*.npy
+*.png
+*.jpg
+session*/
+crops*/
+predictions/
+*_logs/
+*.centered_instance.*/
+__pycache__/
+.mplcache/
+
+# --- Per-video drivers and cluster job scripts ---------------------------
+# track_<dataset>.py wires config.py to one specific video, skeleton and
+# session path; job_*.sh hardcode a Slurm allocation and /scratch paths. Both
+# are per-experiment artefacts, not library code, and are deliberately not
+# versioned here. tests/test_contracts.py still checks any track_*.py present
+# in a working tree, so a local driver is validated even though it is ignored.
+track_*.py
+job_*.sh

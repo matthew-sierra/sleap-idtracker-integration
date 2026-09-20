@@ -93,6 +93,62 @@ def oks_matrix(gt: np.ndarray, pr: np.ndarray, stddev: float = 0.025) -> np.ndar
     return ks.sum(-1) / n_vis[:, None]  # (nG, nP)
 
 
+def oks_pairs(gt: np.ndarray, pr: np.ndarray, stddev: float = 0.025) -> np.ndarray:
+    """OKS for ALIGNED pairs only: gt (P, N, 2), pr (P, N, 2) -> (P,).
+
+    Row-wise twin of `oks_matrix`, for the neighbour-gated path in
+    build_overlaps.py: it scores the P candidate pairs rather than every
+    combination, so gating actually removes work instead of masking it
+    afterwards. Identical arithmetic -- `oks_pairs(g[i], p[j])` equals
+    `oks_matrix(g, p)[i, j]` -- so gating cannot change a score, only skip one.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        gx, gy = gt[..., 0], gt[..., 1]                      # (P, N)
+        xr = np.nanmax(gx, 1) - np.nanmin(gx, 1)
+        yr = np.nanmax(gy, 1) - np.nanmin(gy, 1)
+    area = np.where(np.isfinite(xr) & np.isfinite(yr), xr * yr, np.nan)   # (P,)
+
+    d2 = ((gt - pr) ** 2).sum(-1)                            # (P, N)
+    d2 = np.where(np.isnan(pr).any(-1), np.inf, d2)
+
+    norm = ((2 * stddev) ** 2) * (2 * (area + np.spacing(1)))[:, None]    # (P, 1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        ks = np.exp(-(d2 / norm))
+
+    missing_gt = np.isnan(gt).any(-1)                        # (P, N)
+    ks = np.where(missing_gt, 0.0, ks)
+    n_vis = (~missing_gt).sum(-1).astype(float)
+    n_vis[n_vis == 0] = np.nan
+    return ks.sum(-1) / n_vis
+
+
+def iou_pairs(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    """bbox IoU for ALIGNED pairs only: A (P, 4), B (P, 4) -> (P,).
+
+    Row-wise twin of `iou_matrix`, same `+1` inclusive-pixel convention.
+    """
+    ix0 = np.maximum(A[:, 0], B[:, 0]); iy0 = np.maximum(A[:, 1], B[:, 1])
+    ix1 = np.minimum(A[:, 2], B[:, 2]); iy1 = np.minimum(A[:, 3], B[:, 3])
+    inter = np.clip(ix1 - ix0 + 1, 0, None) * np.clip(iy1 - iy0 + 1, 0, None)
+    area_a = (A[:, 2] - A[:, 0] + 1) * (A[:, 3] - A[:, 1] + 1)
+    area_b = (B[:, 2] - B[:, 0] + 1) * (B[:, 3] - B[:, 1] + 1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        return inter / (area_a + area_b - inter)
+
+
+def centroid_pairs(A: np.ndarray, B: np.ndarray, scale: float) -> np.ndarray:
+    """Centroid similarity for ALIGNED pairs only: A (P, 2), B (P, 2) -> (P,)."""
+    if not np.isfinite(scale) or scale <= 0:
+        raise ValueError(f"centroid similarity needs a positive scale, got {scale!r}")
+    d = np.linalg.norm(A - B, axis=-1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        return np.exp(-d / scale)
+
+
 def poses_to_bboxes(poses: np.ndarray) -> np.ndarray:
     """(n, N, 2) poses -> (n, 4) `[xmin, ymin, xmax, ymax]`, matching `utils.get_bbox`."""
     with warnings.catch_warnings():
@@ -123,6 +179,82 @@ def iou_matrix(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         return inter / union
+
+
+def poses_to_hulls(poses: np.ndarray, i_surround, i_bounded) -> list:
+    """(n, N, 2) poses -> one convex hull polygon per instance, or None.
+
+    The hull is built by EXACTLY the rule that built the id-image silhouette
+    (build_id_images.hull_points + graham_scan): the surrounding keypoints when
+    they are all present, otherwise a Graham scan over every surviving keypoint,
+    surrounding and bounded alike. So an instance that fell back for its crop
+    also falls back here, and the polygon compared frame-to-frame is the same
+    polygon the identity network was shown.
+
+    None marks an instance that cannot form a polygon at all (fewer than three
+    non-collinear points); hull_iou_matrix scores those 0 against everything
+    rather than dropping them, so matrix shape still tracks instance count.
+    """
+    import cv2
+    from build_id_images import (DegenerateHullError, InsufficientKeypointsError,
+                                 graham_scan, hull_points)
+
+    hulls = []
+    for pts in np.asarray(poses, dtype=float):
+        try:
+            src, fallback = hull_points(pts, i_surround, i_bounded)
+            h = graham_scan(src) if fallback else cv2.convexHull(
+                src.astype(np.float32)).reshape(-1, 2)
+        except (InsufficientKeypointsError, DegenerateHullError):
+            hulls.append(None)
+            continue
+        hulls.append(np.asarray(h, dtype=np.float32))
+    return hulls
+
+
+def hull_iou_matrix(A: list, B: list, mask: np.ndarray | None = None) -> np.ndarray:
+    """True IoU between convex hulls: intersection AREA over union AREA.
+
+    S[i, j] = area(A_i n B_j) / area(A_i u B_j)
+            = inter / (area(A_i) + area(B_j) - inter)
+
+    The literal definition, on the polygons themselves -- not on their bounding
+    boxes. `cv2.intersectConvexConvex` returns the exact area of the convex
+    intersection polygon, so `inter` is a real overlapping area rather than the
+    overlap of two axis-aligned rectangles that merely contain the animals. For
+    a rotated or bent animal the box contains a great deal of background, and
+    two boxes can overlap substantially while the silhouettes do not touch at
+    all; this metric cannot report that.
+
+    Union is by inclusion-exclusion, which is exact for two convex sets:
+    |A u B| = |A| + |B| - |A n B|. Returns (nA, nB) in [0, 1].
+
+    `mask`, when given, is an (nA, nB) boolean of candidate pairs -- the
+    neighbour gate from build_overlaps.py. Pairs outside it are left at 0 and,
+    unlike the vectorised metrics, genuinely skip a `cv2.intersectConvexConvex`
+    call. Two hulls further apart than the gate radius cannot intersect, so the
+    skipped entries would have been 0 regardless.
+    """
+    import cv2
+
+    areas_a = np.array([0.0 if h is None else cv2.contourArea(h) for h in A])
+    areas_b = np.array([0.0 if h is None else cv2.contourArea(h) for h in B])
+    S = np.zeros((len(A), len(B)), dtype=float)
+    for i, ha in enumerate(A):
+        if ha is None or areas_a[i] <= 0:
+            continue
+        for j, hb in enumerate(B):
+            if hb is None or areas_b[j] <= 0:
+                continue
+            if mask is not None and not mask[i, j]:
+                continue
+            inter, _ = cv2.intersectConvexConvex(ha, hb)
+            if inter <= 0:
+                continue
+            union = areas_a[i] + areas_b[j] - inter
+            if union > 0:
+                S[i, j] = inter / union
+    return S
 
 
 def poses_to_centroids(poses: np.ndarray) -> np.ndarray:

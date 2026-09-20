@@ -16,14 +16,28 @@ class ResNet18(ResNet):
 
     def __init__(self, n_channels_in: int = 1, n_dimensions_out: int = 8) -> None:
         super().__init__(BasicBlock, [2, 2, 2, 2])
-        if n_channels_in != 3:
-            # adapt first conv layer to our single channel images (not RGB)
-            self.conv1 = torch.nn.Conv2d(
-                n_channels_in, 64, kernel_size=7, stride=2, padding=3, bias=False
-            )
-            nn.init.kaiming_normal_(
-                self.conv1.weight, mode="fan_out", nonlinearity="relu"
-            )
+        # SLEAP-PORT: build conv1 explicitly for EVERY channel count, 3 included.
+        # Original:
+        #     if n_channels_in != 3:
+        #         self.conv1 = torch.nn.Conv2d(...)
+        #         nn.init.kaiming_normal_(...)
+        # Upstream skipped the branch at 3 and inherited torchvision's stock
+        # conv1, on the assumption that 3 channels means ImageNet weights are
+        # wanted. Nothing here ever loads ImageNet weights -- `super().__init__`
+        # is called without a `weights` argument -- so at 3 that inherited layer
+        # was randomly initialised too, just by a different code path. Making it
+        # unconditional means an RGB id-image stem is a 3x7x7 filter bank
+        # initialised by the SAME He-normal scheme as the 1x7x7 grayscale one,
+        # rather than by whichever default torchvision happens to ship.
+        #
+        # Behaviour at n_channels_in != 3 is unchanged, so grayscale sessions and
+        # their checkpoints are unaffected. `fan_out` is 64*7*7 and does not
+        # involve n_channels_in, so the per-weight scale is identical at 1 and 3;
+        # the sqrt(3) larger conv1 output that RGB produces is absorbed by bn1.
+        self.conv1 = torch.nn.Conv2d(
+            n_channels_in, 64, kernel_size=7, stride=2, padding=3, bias=False
+        )
+        nn.init.kaiming_normal_(self.conv1.weight, mode="fan_out", nonlinearity="relu")
 
         # The last fully connected layer gives the coordinates in the embedding space
         # we do not need the bias term because only the relative distances matter

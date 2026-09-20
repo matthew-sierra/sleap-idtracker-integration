@@ -109,7 +109,10 @@ MIN_N_FRAMES_TO_BE_A_CANDIDATE_FOR_ACCUMULATION = (
 def per_frame_state(out_dir: Path) -> tuple[np.ndarray, list[frozenset], np.ndarray]:
     """Read the id-image files into per-frame views.
 
-    Returns ``(frames, fragment_ids_per_frame, n_individuals_per_frame)``.
+    Returns ``(frames, fragment_ids_per_frame, n_individuals_per_frame,
+    is_empty)``, all indexed by a DENSE frame axis spanning the first to the
+    last frame that carries a row. ``is_empty[k]`` marks a frame that carries no
+    row at all, which is distinct from a frame whose rows fail the clean test.
     """
     files = sorted(out_dir.glob("id_images_*.h5"),
                    key=lambda p: int(p.stem.split("_")[-1]))
@@ -128,20 +131,39 @@ def per_frame_state(out_dir: Path) -> tuple[np.ndarray, list[frozenset], np.ndar
     over = np.concatenate(over)
 
     frames = np.arange(int(frame.min()), int(frame.max()) + 1)
-    if not np.isin(frames, frame).all():
-        raise ValueError("frame numbers are not contiguous; the core scan assumes they are")
 
     order = np.argsort(frame, kind="stable")
     frame, frag, over = frame[order], frag[order], over[order]
     bounds = np.searchsorted(frame, frames)
     bounds = np.append(bounds, len(frame))
 
+    # A frame SLEAP predicted nothing in has no row here, so `searchsorted`
+    # gives it lo == hi and it falls out of the loop as an empty fragment set
+    # with zero individuals. That is the truth about such a frame, and it is
+    # already what the core scan wants: `clean` is False there, so the frame can
+    # neither be a core nor continue one, and a run of clean frames spanning it
+    # is correctly split.
+    #
+    # Emptiness is therefore handled whether or not it is named. `is_empty`
+    # names it because `clean` goes False for two unrelated reasons -- no data at
+    # all, or data showing the wrong number of individuals -- and only the second
+    # says anything about the animals. Collapsing them loses the distinction at
+    # exactly the point a reader wants it, and it is the difference between
+    # "SLEAP found nothing" and "SLEAP found the wrong thing". Derived from
+    # `lo == hi` rather than recomputed from the frame numbers, so the label and
+    # the empty set cannot disagree.
     ids_per_frame, n_individuals = [], np.zeros(len(frames), dtype=int)
+    is_empty = np.zeros(len(frames), dtype=bool)
     for k in range(len(frames)):
         lo, hi = bounds[k], bounds[k + 1]
+        is_empty[k] = lo == hi
         ids_per_frame.append(frozenset(frag[lo:hi].tolist()))
         n_individuals[k] = int((~over[lo:hi]).sum())
-    return frames, ids_per_frame, n_individuals
+
+    if is_empty.any():
+        print(f"  {int(is_empty.sum())}/{len(frames)} frames labelled EMPTY "
+              "(no id-image row; SLEAP predicted nothing there)")
+    return frames, ids_per_frame, n_individuals, is_empty
 
 
 def core_flags(ids_per_frame, n_individuals, n_per_frame, n_animals: int) -> np.ndarray:
@@ -250,15 +272,20 @@ def main(out_dir: Path = OUT_DIR, fragments_json: Path = FRAGMENTS_JSON,
     n_animals = lof.n_animals
     print(f"loaded {len(fragments)} fragments, n_animals={n_animals}")
 
-    frames, ids_per_frame, n_individuals = per_frame_state(out_dir)
+    frames, ids_per_frame, n_individuals, is_empty = per_frame_state(out_dir)
     n_per_frame = np.array([len(s) for s in ids_per_frame])
-    print(f"  {len(frames)} frames, {int(n_per_frame.min())}-{int(n_per_frame.max())} "
-          f"fragments alive per frame")
+    # Quoted over the frames that HAVE data: including the empties would drag
+    # the minimum to 0 and say nothing about how many animals were found.
+    live = n_per_frame[~is_empty]
+    print(f"  {len(frames)} frames, {int(live.min())}-{int(live.max())} fragments "
+          f"alive per frame over the {int((~is_empty).sum())} non-empty ones")
 
     core = core_flags(ids_per_frame, n_individuals, n_per_frame, n_animals)
     starts = first_frames_of_cores(core)
     clean = (n_per_frame == n_animals) & (n_individuals == n_animals)
     print(f"  clean frames (right number of individuals): {int(clean.sum())}/{len(frames)}")
+    print(f"    not clean: {int((~clean & ~is_empty).sum())} with data, "
+          f"{int(is_empty.sum())} empty")
     print(f"  core frames: {int(core.sum())}, distinct cores: {len(starts)}")
 
     global_fragments = [
@@ -324,6 +351,12 @@ def main(out_dir: Path = OUT_DIR, fragments_json: Path = FRAGMENTS_JSON,
             for g in allgf),
         "is_unique(n_animals) before identities assigned": all(
             len(set(g.fragments_identifiers)) == n_animals for g in allgf),
+        # The invariant that makes labelling a frame EMPTY safe rather than
+        # merely tidy. An empty frame has n_per_frame == 0, so `clean` is False
+        # and core_flags skips it -- meaning it can never reach `starts` and can
+        # never have GlobalFragment() built over its (empty) fragment set. If
+        # this ever fails, a global fragment was constructed from no fragments.
+        "no empty frame is a core": not bool(core[is_empty].any()),
     }
     for k, v in checks.items():
         print(f"  {'PASS' if v else 'FAIL'}  {k}")

@@ -19,11 +19,12 @@ literally the flag would be a constant True, which is why it is named for what
 it actually measures here instead:
 
     is_overlapping[r] == True
-        -> at least one alternative frame-to-frame assignment costs within
-           SIMILARITY_THRESHOLD of the optimal one (measured on the scale set by
-           GAP_SCALE), and this instance's partner changes under it. Some other
-           animal is nearly as good an explanation for this detection, so
-           propagating identity across this link is unsafe.
+        -> the SECOND-BEST frame-to-frame assignment costs within
+           SIMILARITY_THRESHOLD of the best one -- measured on the scale set by
+           GAP_SCALE, which defaults to "total", the raw difference between the
+           two assignment costs -- and this instance's partner changes under it.
+           Some other animal is nearly as good an explanation for this
+           detection, so propagating identity across this link is unsafe.
 
 This is the *negation* of upstream's field: ``is_an_individual == not
 is_overlapping``. The inversion is applied once, at the boundary where upstream
@@ -57,6 +58,14 @@ For each consecutive frame pair (t, u):
               (SIMILARITY_METHOD: bbox IoU, OKS, or centroid decay)
     C       = 1 - S                          (cost; Hungarian minimises)
     sigma   = linear_sum_assignment(C)       (the committed assignment)
+
+THE SOLVER. ``scipy.optimize.linear_sum_assignment`` solves the linear sum
+assignment problem exactly -- the Hungarian (Kuhn-Munkres) problem -- using a
+modified Jonker-Volgenant shortest-augmenting-path algorithm with no
+initialization (Crouse 2016), O(n^3). It is exact, not heuristic: the assignment
+it returns is a global minimum, which is what makes the "second best" question
+well posed and the pruning bound below valid.
+
     opt     = C[sigma].sum()
 
 A plain Hungarian solve stops here and reports only the winner. It cannot tell a
@@ -72,10 +81,14 @@ instance whose partner differs between sigma and that alternative is flagged --
 not just i and j, because the two permutations differ by a cycle and every
 animal on that cycle is mutually confusable.
 
-Under GAP_SCALE = "per_edge" the comparison is gap / n_changed rather
-than gap, which is a ratio and so is NOT what a Hungarian solve minimises. It is
-still answered exactly, in the same one-solve-per-cell budget, by shifting the
-cost matrix first; see the comment in ``assignment_ambiguity``.
+Under the default GAP_SCALE = "total" the comparison is that raw gap, so the
+minimum over all off-assignment cells IS the cost of the second-best assignment,
+and the test reads exactly as "second best within SIMILARITY_THRESHOLD of best".
+
+Under GAP_SCALE = "per_edge" the comparison is gap / n_changed instead, which is
+a ratio and so is NOT what a Hungarian solve minimises. It is still answered
+exactly, in the same one-solve-per-cell budget, by shifting the cost matrix
+first; see the comment in ``assignment_ambiguity``.
 
 Doing this naively is n^2 Hungarian solves per frame pair. The prune is exact,
 not heuristic: removing a column can only make an assignment problem more
@@ -136,11 +149,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import config  # noqa: E402
 from assignment_margin import (  # noqa: E402
-    centroid_matrix, iou_matrix, oks_matrix, poses_to_bboxes, poses_to_centroids)
+    centroid_matrix, centroid_pairs, hull_iou_matrix, iou_matrix, iou_pairs,
+    oks_matrix, oks_pairs, poses_to_bboxes, poses_to_centroids, poses_to_hulls)
 from build_id_images import node_index  # noqa: E402
 
 BODY_NODES = config.BODY_NODES
 CENTROID_NODE = config.CENTROID_NODE
+SURROUNDING_KEYPOINTS = config.SURROUNDING_KEYPOINTS
+BOUNDED_KEYPOINTS = config.BOUNDED_KEYPOINTS
+# Filled in main() once the skeleton is known; only the 'hull' method reads them.
+HULL_SURROUND_IDX: list[int] = []
+HULL_BOUNDED_IDX: list[int] = []
 
 REPO = config.REPO
 SLP = config.SLP
@@ -160,6 +179,7 @@ OVERLAP_NODES = config.OVERLAP_NODES
 OVERLAP_DIRECTION = config.OVERLAP_DIRECTION
 MAX_FRAME_GAP = config.MAX_FRAME_GAP
 GAP_SCALE = config.GAP_SCALE
+NEIGHBOUR_RADIUS = getattr(config, "NEIGHBOUR_RADIUS", None)
 UNMATCHED_COST = config.UNMATCHED_COST
 REPORT_CEILING = config.REPORT_CEILING
 TIE_TOL = config.TIE_TOL
@@ -341,7 +361,14 @@ def frame_geometry(labels, node_idx, cen_idx, method: str = SIMILARITY_METHOD):
         centroids.append(poses[:, cen_idx, :].copy())
         sel = poses if node_idx is None else poses[:, node_idx, :]
         frames.append(int(lf.frame_idx))
-        if method == "bounding_box":
+        if method == "hull":
+            # NOT `sel`: SURROUNDING/BOUNDED_KEYPOINTS index into the full
+            # skeleton, the same way build_id_images does it. OVERLAP_NODES does
+            # not apply here -- which nodes form the hull is already decided by
+            # the surrounding/bounded split, and applying a second subset would
+            # silently compare a different polygon than the crop was cut from.
+            features.append(poses_to_hulls(poses, HULL_SURROUND_IDX, HULL_BOUNDED_IDX))
+        elif method == "bounding_box":
             features.append(poses_to_bboxes(sel))
         elif method == "keypoint":
             features.append(sel)
@@ -352,23 +379,74 @@ def frame_geometry(labels, node_idx, cen_idx, method: str = SIMILARITY_METHOD):
     return frames, features, centroids
 
 
+def neighbour_mask(cen_a, cen_b, radius: float | None) -> np.ndarray | None:
+    """(nA, nB) boolean of pairs worth scoring, or None when the gate is off.
+
+    A pair is a candidate when the two CENTROID_NODE positions are within
+    `radius` pixels. An animal cannot be matched to something further away than
+    that in one frame step, so the rest of the matrix is known to be 0 without
+    computing it -- see config.NEIGHBOUR_RADIUS for where that is exact and
+    where it is not.
+
+    A MISSING centroid (CENTROID_NODE NaN) yields a NaN distance, and the test
+    is written `~(d > radius)` rather than `d <= radius` so NaN falls on the
+    KEEP side. Absence of a position is not evidence of distance, and excluding
+    on it would silently drop links the ungated code would have made.
+    """
+    if radius is None or cen_a is None or cen_b is None:
+        return None
+    d = np.linalg.norm(np.asarray(cen_a, dtype=float)[:, None, :]
+                       - np.asarray(cen_b, dtype=float)[None, :, :], axis=-1)
+    return ~(d > float(radius))
+
+
 def similarity(A: np.ndarray, B: np.ndarray, method: str = SIMILARITY_METHOD,
-               scale: float | None = None) -> np.ndarray:
+               scale: float | None = None, cen_a=None, cen_b=None,
+               radius: float | None = None) -> np.ndarray:
     """Frame-to-frame similarity in [0, 1], all-NaN instances degraded to zero.
 
     Dispatches on SIMILARITY_METHOD. Every branch returns [0, 1] so that the
     caller's `C = 1 - S` stays a valid cost against UNMATCHED_COST padding.
+
+    When `radius` is given, only pairs inside the neighbour gate are scored and
+    the rest stay at 0. The gated path calls the row-wise `*_pairs` twins from
+    assignment_margin rather than the all-pairs matrix functions, so the skipped
+    cells cost nothing at all -- masking a full matrix afterwards would compute
+    them and throw them away. The arithmetic is identical either way, so a cell
+    inside the gate scores exactly what it would have scored ungated.
     """
-    if method == "bounding_box":
-        S = iou_matrix(A, B)
-    elif method == "keypoint":
-        S = oks_matrix(A, B)
-    elif method == "centroid":
-        if scale is None:
-            raise ValueError("centroid similarity needs a body-length scale")
-        S = centroid_matrix(A, B, scale)
+    mask = neighbour_mask(cen_a, cen_b, radius)
+
+    if method == "hull":
+        # True IoU on the silhouettes: intersection area over union area of the
+        # two convex hulls, the same polygons the id-images were masked with.
+        # The mask goes in, so gated pairs skip the cv2 intersection entirely.
+        S = hull_iou_matrix(A, B, mask)
+    elif mask is None:
+        if method == "bounding_box":
+            S = iou_matrix(A, B)
+        elif method == "keypoint":
+            S = oks_matrix(A, B)
+        elif method == "centroid":
+            if scale is None:
+                raise ValueError("centroid similarity needs a body-length scale")
+            S = centroid_matrix(A, B, scale)
+        else:
+            raise ValueError(f"unknown SIMILARITY_METHOD {method!r}")
     else:
-        raise ValueError(f"unknown SIMILARITY_METHOD {method!r}")
+        ii, jj = np.nonzero(mask)
+        S = np.zeros((len(A), len(B)), dtype=float)
+        if ii.size:
+            if method == "bounding_box":
+                S[ii, jj] = iou_pairs(A[ii], B[jj])
+            elif method == "keypoint":
+                S[ii, jj] = oks_pairs(A[ii], B[jj])
+            elif method == "centroid":
+                if scale is None:
+                    raise ValueError("centroid similarity needs a body-length scale")
+                S[ii, jj] = centroid_pairs(A[ii], B[jj], scale)
+            else:
+                raise ValueError(f"unknown SIMILARITY_METHOD {method!r}")
     return np.nan_to_num(S, nan=0.0, posinf=0.0, neginf=0.0)
 
 
@@ -400,7 +478,8 @@ def body_length_from_h5(out_dir: Path) -> float:
 
 
 def compute_flags(labels, node_idx, cen_idx, threshold: float,
-                  method: str = SIMILARITY_METHOD, scale: float | None = None):
+                  method: str = SIMILARITY_METHOD, scale: float | None = None,
+                  radius: float | None = None):
     """Walk consecutive frame pairs, collecting ambiguity AND the links together.
 
     One pass over the movie produces both outputs, because they come from the
@@ -418,12 +497,17 @@ def compute_flags(labels, node_idx, cen_idx, threshold: float,
     margins: list[np.ndarray] = []
     exact_gaps: list[float] = []
     n_pairs = 0
+    n_cells = n_scored = 0          # neighbour-gate bookkeeping
 
-    for (ft, A), (fu, B) in zip(zip(frames, features), zip(frames[1:], features[1:])):
+    for (ft, A, ca), (fu, B, cb) in zip(zip(frames, features, centroids),
+                                        zip(frames[1:], features[1:], centroids[1:])):
         if fu - ft > MAX_FRAME_GAP:
             continue
         n_pairs += 1
-        S = similarity(A, B, method, scale)
+        gate = neighbour_mask(ca, cb, radius)
+        n_cells += len(A) * len(B)
+        n_scored += int(gate.sum()) if gate is not None else len(A) * len(B)
+        S = similarity(A, B, method, scale, ca, cb, radius)
         C = 1.0 - S
 
         row_flag, col_flag, row_gap, sigma = assignment_ambiguity(C, threshold)
@@ -452,6 +536,7 @@ def compute_flags(labels, node_idx, cen_idx, threshold: float,
         succ=succ, succ_frame=succ_frame,
         margins=np.concatenate(margins) if margins else np.empty(0),
         exact_gaps=np.asarray(exact_gaps), n_pairs=n_pairs,
+        n_cells=n_cells, n_scored=n_scored,
     )
 
 
@@ -556,23 +641,43 @@ def main(slp_path: Path = SLP, out_dir: Path = OUT_DIR) -> None:
 
     cen_idx = node_index(skel, CENTROID_NODE)
 
+    if SIMILARITY_METHOD == "hull":
+        # Same resolution build_id_images does, so the hulls compared here are
+        # the hulls the crops were cut from.
+        global HULL_SURROUND_IDX, HULL_BOUNDED_IDX
+        HULL_SURROUND_IDX = [node_index(skel, n) for n in SURROUNDING_KEYPOINTS]
+        HULL_BOUNDED_IDX = [node_index(skel, n) for n in BOUNDED_KEYPOINTS]
+        print(f"  hull similarity: surrounding={SURROUNDING_KEYPOINTS}, "
+              f"bounded={BOUNDED_KEYPOINTS}")
+
     n_inst = sum(len(lf.instances) for lf in labels.labeled_frames)
     print(f"  {len(labels.labeled_frames)} frames, {n_inst} instances")
     # The centroid metric is the only one with a scale: it needs the median
     # body length to express distance in body lengths. Read from the id-image
     # files so it is the SAME number the crops were sized with.
-    centroid_scale = (body_length_from_h5(out_dir)
-                      if SIMILARITY_METHOD == "centroid" else None)
+    body_length = body_length_from_h5(out_dir)
+    centroid_scale = body_length if SIMILARITY_METHOD == "centroid" else None
     if centroid_scale is not None:
         print(f"centroid similarity scale: {centroid_scale:.1f} px "
               "(median body length)")
+    gate_radius = (None if NEIGHBOUR_RADIUS is None
+                   else float(NEIGHBOUR_RADIUS) * body_length)
+    if gate_radius is None:
+        print("neighbour gate: OFF (scoring every pair)")
+    else:
+        print(f"neighbour gate: {NEIGHBOUR_RADIUS} body length(s) "
+              f"= {gate_radius:.1f} px")
     print(f"overlap: {SIMILARITY_METHOD}, {OVERLAP_NODES}-nodes, "
           f"{GAP_SCALE} gap <= {SIMILARITY_THRESHOLD} => overlapping, "
           f"direction={OVERLAP_DIRECTION}")
 
     print("scanning consecutive frame pairs (flags and links in one pass)")
     res = compute_flags(labels, node_idx, cen_idx, SIMILARITY_THRESHOLD,
-                        SIMILARITY_METHOD, centroid_scale)
+                        SIMILARITY_METHOD, centroid_scale, gate_radius)
+    if gate_radius is not None and res["n_cells"]:
+        skipped = res["n_cells"] - res["n_scored"]
+        print(f"  neighbour gate scored {res['n_scored']}/{res['n_cells']} cells "
+              f"({100 * skipped / res['n_cells']:.1f}% skipped)")
     overlapping = resolve(res, OVERLAP_DIRECTION)
     centroid_of = dict(zip(res["frames"], res["centroids"]))
     print(f"  {res['n_pairs']} frame pairs solved ({time.time() - t0:.0f}s)")
@@ -697,6 +802,10 @@ def main(slp_path: Path = SLP, out_dir: Path = OUT_DIR) -> None:
                                if centroid_scale is not None else float("nan")),
                 overlap_direction=OVERLAP_DIRECTION,
                 overlap_gap_scale=GAP_SCALE,
+                overlap_neighbour_radius=(float("nan") if NEIGHBOUR_RADIUS is None
+                                          else float(NEIGHBOUR_RADIUS)),
+                overlap_gate_px=(float("nan") if gate_radius is None
+                                 else float(gate_radius)),
                 overlap_max_frame_gap=int(MAX_FRAME_GAP),
             )
             # Files are reopened r+, so a knob that was renamed or dropped since

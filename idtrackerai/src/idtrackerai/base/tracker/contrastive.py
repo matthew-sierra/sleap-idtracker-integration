@@ -2,8 +2,10 @@
 
 import json
 import logging
+import os
 import random
 import signal
+import sys
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from functools import partial, wraps
 from pathlib import Path
@@ -25,6 +27,94 @@ from torch.optim.adam import Adam
 from torch.optim.optimizer import Optimizer
 from torch.utils.data import DataLoader, Dataset, Sampler, TensorDataset
 
+# SLEAP-PORT: per-batch loss recorder. Nothing upstream is removed by this --
+# the block below is additive, and the single call site inside train_step() is
+# marked with its own SLEAP-PORT comment.
+#
+# WHY IT EXISTS. Upstream reports training progress two ways, and neither
+# survives a batch job. `train_step`'s `output` callback writes into a
+# `rich.console.Console().status(...)` spinner (train(), below), which renders
+# nothing at all to a non-TTY; and the per-validation summary is
+# `logging.debug`, which is below the default level. Redirect stdout to a Slurm
+# .out file and the whole training curve is simply absent.
+#
+# So: every batch's mean loss is appended to a CSV, and a progress line is
+# printed on plain stdout every PROGRESS_EVERY batches. print() rather than
+# logging, deliberately -- it needs no handler configuration to reach a
+# redirected stdout, which is the exact failure mode being fixed.
+#
+# The CSV path comes from the environment, so no caller signature changes and a
+# run without the variable set behaves exactly as upstream does:
+#
+#     export SLEAP_IDTRACKER_LOSS_CSV=/path/to/session/loss_per_batch.csv
+#
+# Columns:
+#   epoch        index of the train_step() CALL, i.e. how many validation
+#                cycles have completed. There is no epoch in the upstream sense
+#                (the sampler draws pairs indefinitely, it never walks a
+#                dataset once), so this is the nearest real boundary: the
+#                trainer's own check_every block.
+#   batch        1-based position within that call.
+#   global_step  cumulative batch number since training began. This is
+#                upstream's own `batch_number`, unmodified.
+#   loss         mean of the batch's per-pair losses -- the exact scalar that
+#                was backpropagated (`losses.mean().backward()`).
+_LOSS_CSV_ENV = "SLEAP_IDTRACKER_LOSS_CSV"
+_PROGRESS_EVERY = 50
+_loss_csv_handle = None
+_loss_csv_failed = False
+
+
+def _loss_csv():
+    """Open the CSV once, lazily. Returns None when logging is not configured.
+
+    Append mode: a resumed or restarted run adds to the curve rather than
+    truncating the part already recorded. The header is written only when the
+    file is new.
+    """
+    global _loss_csv_handle, _loss_csv_failed
+    if _loss_csv_handle is not None or _loss_csv_failed:
+        return _loss_csv_handle
+    path = os.environ.get(_LOSS_CSV_ENV)
+    if not path:
+        _loss_csv_failed = True
+        return None
+    try:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        is_new = not path.is_file() or path.stat().st_size == 0
+        _loss_csv_handle = path.open("a", buffering=1)  # line buffered
+        if is_new:
+            _loss_csv_handle.write("epoch,batch,global_step,loss\n")
+            _loss_csv_handle.flush()
+        print(f"[loss-log] per-batch loss -> {path}", flush=True)
+    except OSError as exc:
+        # Logging must never be the thing that kills a training run.
+        _loss_csv_failed = True
+        print(f"[loss-log] DISABLED: cannot open {path}: {exc}", flush=True)
+        return None
+    return _loss_csv_handle
+
+
+def _record_batch_loss(epoch: int, batch: int, global_step: int, loss: float,
+                       n_loss_positive: int, n_loss_negative: int,
+                       batch_size: int) -> None:
+    """One CSV row per batch, plus a stdout line every _PROGRESS_EVERY batches."""
+    fh = _loss_csv()
+    if fh is not None:
+        try:
+            fh.write(f"{epoch},{batch},{global_step},{loss:.8f}\n")
+        except OSError:
+            pass
+    if global_step % _PROGRESS_EVERY == 0:
+        print(f"[train] epoch {epoch:5d} | batch {batch:4d} | "
+              f"global_step {global_step:7d} | loss {loss:.6f} | "
+              f"+pairs too far {n_loss_positive:4d}/{batch_size} | "
+              f"-pairs too close {n_loss_negative:4d}/{batch_size}",
+              flush=True)
+        sys.stdout.flush()
+
+
 from idtrackerai import (
     Fragment,
     GlobalFragment,
@@ -39,7 +129,9 @@ from idtrackerai.base.network import (
     ResNet18,
     get_onthefly_dataloader,
 )
-from idtrackerai.utils import H5DatasetProxy, load_id_images, track
+from idtrackerai.utils import (
+    H5DatasetProxy, load_id_images, nchw_for, nchw_grayscale, track,
+)
 
 
 def _ignore_sigint_in_worker(_worker_id: int) -> None:
@@ -229,6 +321,10 @@ class ContrastiveLearning:
     """Saving folder for checkpoints"""
     batch_size: int
     """Number of pairs of each kind of images (positive and negative) used in a single training batch"""
+    n_channels: int = 1
+    """SLEAP-PORT: channels per id-image pixel. 1 for grayscale (upstream's only
+    case, and the default, so nothing changes unless it is set), 3 for RGB. The
+    port assigns it from config.N_CHANNELS before calling set_model()."""
     checkpoint_filename: str = "contrastive_checkpoint.pt"
 
     @property
@@ -376,7 +472,12 @@ class ContrastiveLearning:
             torch.tensor(val_images), torch.zeros(len(val_images), dtype=torch.int8)
         )  # dummy light-weight labels to reuse dataloader code
 
-        collate_fn = partial(collate_fun, images_sources=image_sources)
+        # SLEAP-PORT: to_nchw is resolved once here and baked into the partial,
+        # so the collate that runs on every batch performs no shape dispatch.
+        collate_fn = partial(
+            collate_fun, images_sources=image_sources,
+            to_nchw=nchw_for(self.n_channels),
+        )
 
         if not isinstance(image_sources[0], np.ndarray):
             # if images are not loaded, we need more workers to load them on the fly
@@ -466,10 +567,13 @@ class ContrastiveLearning:
             " the groundtruth dataset to initialize K-Means clustering"
         )
 
+        # SLEAP-PORT: was torch.from_numpy(...).unsqueeze(1). nchw_for picks the
+        # grayscale or RGB block once from the session's channel count; the
+        # function it returns has no branch in it.
         first_gfrag_images = (
-            torch.from_numpy(
+            nchw_for(self.n_channels)(
                 load_id_images(image_sources, image_locations, False, np.float32)
-            ).unsqueeze(1)
+            )
             / 255
         )
         first_gfrag_dataset = TensorDataset(first_gfrag_images, torch.tensor(frag_ids))
@@ -505,11 +609,26 @@ class ContrastiveLearning:
                 )
 
             self.model = ResNet18.from_file(weights_path)
+            # SLEAP-PORT: from_file infers n_channels_in from conv1.weight, so a
+            # grayscale checkpoint silently returns a 1-channel model even in an
+            # RGB session. Caught here rather than at the first forward pass,
+            # where it surfaces as an opaque Conv2d shape error.
+            got = self.model.conv1.weight.shape[1]
+            if got != self.n_channels:
+                raise ValueError(
+                    f"checkpoint {weights_path} holds a {got}-channel model but "
+                    f"this session is {self.n_channels}-channel "
+                    "(config.COLOR_MODE). Delete the checkpoint to retrain, or "
+                    "run in the mode it was trained in."
+                )
         else:
             # initialize model from scratch
             logging.info("Randomly initializing contrastive model")
+            # SLEAP-PORT: was hardcoded n_channels_in=1. RGB id-images give conv1
+            # a 3x7x7 filter bank, He-normal initialised (models.py).
             self.model = ResNet18(
-                n_channels_in=1, n_dimensions_out=self.embedding_dimensions
+                n_channels_in=self.n_channels,
+                n_dimensions_out=self.embedding_dimensions,
             )
 
         self.model = self.model.to(DEVICE)
@@ -582,6 +701,20 @@ class ContrastiveLearning:
             total_n_loss_positive += n_loss_positive
             total_n_loss_negative += n_loss_negative
             n_pairs += self.batch_size
+
+            # SLEAP-PORT: record this batch. `losses.mean()` is the scalar that
+            # was backpropagated three lines up; recomputing the mean of the
+            # already-detached copy costs one reduction and keeps the autograd
+            # graph out of it.
+            _record_batch_loss(
+                epoch=starting_batch_number // max(n_batches, 1),
+                batch=batch_number - starting_batch_number,
+                global_step=batch_number,
+                loss=float(losses.detach().mean().item()),
+                n_loss_positive=n_loss_positive,
+                n_loss_negative=n_loss_negative,
+                batch_size=self.batch_size,
+            )
 
             output(
                 f"[red]Batch {batch_number:2}: sampled {self.batch_size} positive pairs ({n_loss_positive:3d} "
@@ -874,6 +1007,7 @@ class ContrastiveLearning:
 def collate_fun(
     batch: list[tuple[tuple[int, int], tuple[int, int], int]],
     images_sources: Sequence[h5py.Dataset | Path | str | np.ndarray | H5DatasetProxy],
+    to_nchw=nchw_grayscale,
 ) -> list[Tensor]:
     """Receives the batch with N groups of images locations (episode and index) and a label.
     These are used to load the images and generate the batch tensor"""
@@ -882,7 +1016,7 @@ def collate_fun(
     images = load_id_images(
         images_sources, np.concatenate(locations), verbose=False, dtype=np.float32
     )
-    images = torch.from_numpy(images).unsqueeze(1) / 255
+    images = to_nchw(images) / 255  # SLEAP-PORT: layout chosen by the caller
     return [
         *torch.split(images, [len(location) for location in locations]),
         torch.tensor(labels),

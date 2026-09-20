@@ -72,7 +72,15 @@ from idtrackerai.base.tracker.contrastive import ContrastiveLearning  # noqa: E4
 from idtrackerai.list_of_fragments import ListOfFragments  # noqa: E402
 from idtrackerai.list_of_global_fragments import ListOfGlobalFragments  # noqa: E402
 from idtrackerai.utils import conf  # noqa: E402
-from idtrackerai.utils.py_utils import load_id_images  # noqa: E402
+from idtrackerai.utils.py_utils import (  # noqa: E402
+    load_id_images, nchw_for,
+)
+
+# The id-image -> NCHW layout for this session, chosen ONCE from the declared
+# colour mode rather than re-derived from each batch's shape. Every video is
+# wholly one mode or the other, and build_id_images.py has already refused to
+# write a file that disagrees, so nothing downstream needs to look again.
+TO_NCHW = nchw_for(config.N_CHANNELS)
 
 OUT_DIR = config.OUT_DIR
 FRAGMENTS_JSON = config.FRAGMENTS_JSON
@@ -101,10 +109,10 @@ REUSE_CHECKPOINT = True
 # the preloaded image array. See single_process_loaders() below.
 SINGLE_PROCESS_LOADERS = sys.platform == "darwin"
 
-TRAIN_CHECK_EVERY = 10
+TRAIN_CHECK_EVERY = 50
 TRAIN_SKIPPED_VALIDATIONS = 1
-TRAIN_PATIENCE = 2
-TRAIN_TARGET_SILHOUETTE = 0.0
+TRAIN_PATIENCE = 30
+TRAIN_TARGET_SILHOUETTE = 0.91
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +156,11 @@ def train(lof: ListOfFragments, first_gfrag) -> tuple[ContrastiveLearning, float
     contrastive = ContrastiveLearning(
         lof, saving_folder=ACCUMULATION_DIR, first_gfrag=first_gfrag
     )
+    # Decides conv1's depth: a 1x7x7 filter bank for grayscale, 3x7x7 for RGB,
+    # He-normal initialised either way (models.py). Must be set BEFORE
+    # set_model(), which is where the model is actually built, and which also
+    # rejects a checkpoint whose channel count disagrees.
+    contrastive.n_channels = config.N_CHANNELS
     if SINGLE_PROCESS_LOADERS:
         single_process_loaders(contrastive)
 
@@ -259,6 +272,129 @@ def assign_p2_identities(lof: ListOfFragments) -> tuple[dict[int, int], dict]:
     return out, stats
 
 
+def enforce_p1_uniqueness(lof: ListOfFragments, eps: float = 1e-12) -> dict:
+    """Stop two COEXISTING fragments from both hard-vetoing the same identity.
+
+    THE PROBLEM. ``set_P1_from_frequencies`` (fragment.py:483-491) is a base-2
+    softmax over vote counts, so algebraically P1 can never reach 1.0 -- some
+    mass always stays on the losers. In float64 it does: once the winner leads
+    by ~53 votes, 2**53 exceeds the mantissa and the other terms round away.
+    Trivial for a fragment of a few hundred images; MEASURED on Pletcher and on
+    oline_multimouse, ~52% of predicted fragments saturate to exactly 1.0.
+
+    ``compute_P2_vector`` (fragment.py:464) then multiplies by
+    ``prod(1 - coexisting_P1)``. A saturated neighbour contributes an EXACT
+    0.0, which is not a strong prior but an irrevocable veto: that identity
+    becomes arithmetically impossible for this fragment, permanently. With
+    N animals the other N-1 legitimately claim N-1 identities, leaving exactly
+    one free -- so the all-vetoed state is UNREACHABLE unless the network puts
+    two coexisting fragments on the same cluster. When it does, the last slot
+    closes, the numerator is all zeros, the denominator is zero, and
+    ``assign_identity`` (fragment.py:428-433) reads the zero vector as an
+    N-way tie and returns identity 0. Both fragments annihilate, and the
+    identity they were fighting over ends up used by nobody.
+
+    MEASURED on oline_multimouse: 92 coexisting duplicate pairs; 108 fragments
+    (58841 images) fully vetoed; one of them, #1284 (1582 images), is the
+    1729-frame track-5 gap.
+
+    WHAT THIS DOES. Upstream never reaches that state, because every route to a
+    one-hot P1 passes through the accumulation protocol's uniqueness
+    enforcement first: ``P1_array[:, temporary_id] = 0.0`` after each
+    assignment (accumulation_manager.py:545), an explicit
+    ``is_inconsistent_with_coexistent_fragments`` check (:537), and a final
+    ``global_fragment.is_unique(n_animals)`` rollback (globalfragment.py:72).
+    This port skips the protocol and feeds raw network argmaxes straight to P2,
+    so that guarantee is absent. This function restores the guarantee alone,
+    at the P1 stage, which is the smallest place it can live:
+
+        for each set of COEXISTING fragments whose saturated P1 claims the
+        SAME identity, the one with the most images keeps the claim; the rest
+        are DESATURATED so 1 - P1 is 1e-12 rather than 0.0.
+
+    A demoted fragment still discounts that identity by a factor of a trillion
+    -- it is not being ignored, only stopped from being infinite. Its argmax is
+    unchanged, so it still prefers the same identity and can still be assigned
+    it; nothing here assigns or forbids any identity, the cascade still decides.
+
+    Tie-break is image count (more votes = stronger evidence). Upstream sorts by
+    P1 magnitude, which for saturated fragments ties and degenerates to
+    identifier order; image count is the same idea made explicit.
+
+    NOT a substitute for the accumulation protocol, and it does not touch
+    vendored code -- compute_P2_vector runs unmodified, it just no longer
+    receives an exact 1.0 on a contested slot.
+    """
+    frags = {f.identifier: f for f in lof.fragments if f.is_an_individual}
+
+    def n_images(fid: int) -> int:
+        return int(getattr(frags[fid], "n_images", 0) or 0)
+
+    claim: dict[int, int] = {}
+    for fid, frag in frags.items():
+        p1 = getattr(frag, "P1_vector", None)
+        if p1 is None or not np.any(p1):
+            continue
+        if float(np.max(p1)) >= 1.0:          # saturated -> acts as a hard veto
+            claim[fid] = int(np.argmax(p1))
+
+    coexisting = {
+        fid: [c.identifier for c in frags[fid].coexisting_individual_fragments
+              if c.identifier in claim]
+        for fid in claim
+    }
+
+    demoted: set[int] = set()
+    for fid in sorted(claim, key=n_images, reverse=True):   # strongest first
+        if fid in demoted:
+            continue
+        for other in coexisting[fid]:
+            if other != fid and other not in demoted and claim[other] == claim[fid]:
+                demoted.add(other)
+
+    n = int(lof.n_animals)
+    for fid in demoted:
+        p1 = frags[fid].P1_vector
+        frags[fid].P1_vector = p1 * (1.0 - eps) + eps / n
+
+    pairs = sum(1 for fid in claim for o in coexisting[fid]
+                if o > fid and claim[o] == claim[fid])
+    return {
+        "n_saturated": len(claim),
+        "n_conflicting_pairs": pairs,
+        "n_demoted": len(demoted),
+        "n_images_demoted": sum(n_images(f) for f in demoted),
+        "demoted": sorted(demoted),
+    }
+
+
+def p1_max_snapshot(lof: ListOfFragments) -> dict[int, float]:
+    """fragment_identifier -> max(P1_vector), for INDIVIDUAL fragments only.
+
+    Must be taken BEFORE the P2 cascade runs. ``assign_identity`` collapses
+    P1_vector to a one-hot (fragment.py:449-450), so afterwards every assigned
+    fragment reports max(P1) == 1.0 and the value carries no information.
+
+    This is the evidence the collision tiebreak in build_sleap_tracks.py ranks
+    on: P1 is the base-2 softmax of the per-image votes, normalised to sum to 1,
+    so max(P1) is "how decisively this fragment's own images voted for its
+    winner" and is comparable between fragments of different lengths.
+
+    Crossing fragments are absent from the result by construction: their rows
+    are different animals predicted one at a time, so there is no pooled vote to
+    take a maximum of. They come out NaN downstream, which loses to any real P1.
+    """
+    out: dict[int, float] = {}
+    for frag in lof.fragments:
+        if not frag.is_an_individual:
+            continue
+        p1 = getattr(frag, "P1_vector", None)
+        if p1 is None or not np.any(p1):
+            continue
+        out[frag.identifier] = float(np.max(p1))
+    return out
+
+
 def individual_identities(lof: ListOfFragments) -> dict[int, int]:
     """fragment_identifier -> identity, pooled over the fragment (P1 argmax)."""
     out = {}
@@ -293,7 +429,7 @@ def crossing_identities(
             chunk = locations[i: i + batch]
             imgs = load_id_images(image_sources, chunk, verbose=False, dtype=np.float32)
             # identical preprocessing to collate_fun (contrastive.py:885)
-            tensor = torch.from_numpy(imgs).unsqueeze(1).to(DEVICE) / 255
+            tensor = TO_NCHW(imgs).to(DEVICE) / 255
             prob = identifier(tensor)
             preds += (prob.argmax(1) + 1).tolist()
         out[frag.identifier] = preds
@@ -306,14 +442,23 @@ def crossing_identities(
 
 
 def write_identities(lof: ListOfFragments, per_fragment: dict[int, int],
-                     per_row: dict[int, list[int]]) -> np.ndarray:
-    """Fill the `identities` dataset. Returns the concatenated identity array."""
+                     per_row: dict[int, list[int]],
+                     p1_max: dict[int, float] | None = None) -> np.ndarray:
+    """Fill the `identities` dataset. Returns the concatenated identity array.
+
+    Also writes a per-row `p1_max` column (created if absent): the fragment's
+    max(P1) for rows of an individual fragment, NaN for rows of a crossing
+    fragment, which have no pooled vote. build_sleap_tracks.py ranks colliding
+    claims on it.
+    """
     files = [Path(p) for p in lof.id_images_file_paths]
+    p1_max = p1_max or {}
     sizes = {}
     for e, path in enumerate(files):
         with h5py.File(path, "r") as fh:
             sizes[e] = len(fh["identities"])
     buf = {e: np.zeros(n, dtype=np.int64) for e, n in sizes.items()}
+    p1buf = {e: np.full(n, np.nan, dtype=np.float64) for e, n in sizes.items()}
 
     for frag in lof.fragments:
         locs = list(frag.image_locations)
@@ -321,16 +466,22 @@ def write_identities(lof: ListOfFragments, per_fragment: dict[int, int],
             ident = per_fragment.get(frag.identifier)
             if ident is None:
                 continue
+            pm = float(p1_max.get(frag.identifier, np.nan))
             for img, ep in locs:
                 buf[int(ep)][int(img)] = ident
+                p1buf[int(ep)][int(img)] = pm
         else:
             preds = per_row.get(frag.identifier, [])
             for (img, ep), ident in zip(locs, preds):
-                buf[int(ep)][int(img)] = int(ident)
+                buf[int(ep)][int(img)] = int(ident)   # p1 stays NaN: no vote
 
     for e, path in enumerate(files):
         with h5py.File(path, "r+") as fh:
             fh["identities"][...] = buf[e]
+            if "p1_max" in fh:
+                fh["p1_max"][...] = p1buf[e]
+            else:
+                fh.create_dataset("p1_max", data=p1buf[e])
             fh.attrs["identities_source"] = "build_identities.py"
     return np.concatenate([buf[e] for e in range(len(files))])
 
@@ -392,6 +543,15 @@ def main() -> None:
         # after the cascade argmax(P1) just echoes the assignment and the
         # comparison would be vacuous.
         p1_only = individual_identities(lof)
+        # Before P2: stop coexisting fragments from both hard-vetoing one
+        # identity. Must precede p1_max_snapshot so the snapshot records the
+        # demoted (sub-1.0) values, which is what lets the stage-6 collision
+        # tiebreak tell a demoted duplicate from a clean winner.
+        uniq = enforce_p1_uniqueness(lof)
+        print(f"  P1 uniqueness: {uniq['n_saturated']} saturated, "
+              f"{uniq['n_conflicting_pairs']} coexisting duplicate pair(s), "
+              f"{uniq['n_demoted']} demoted ({uniq['n_images_demoted']} images)")
+        p1_max = p1_max_snapshot(lof)
         n_seeded = seed_missing_P1(lof)
         if n_seeded:
             print(f"  {n_seeded} individual fragment(s) too short for predict() "
@@ -409,6 +569,7 @@ def main() -> None:
               f"fragments{': ' + str(changed) if changed else ''}")
     else:
         per_fragment = individual_identities(lof)
+        p1_max = p1_max_snapshot(lof)
     print(f"  individual fragments identified: {len(per_fragment)}/{n_ind}")
 
     image_sources = contrastive.preload_images(lof.id_images_file_paths, None)
@@ -420,7 +581,7 @@ def main() -> None:
         print(f"    fragment {fid}: frames {frag.start_frame}-{frag.end_frame - 1}, "
               f"{len(preds)} rows -> identities {preds}")
 
-    identities = write_identities(lof, per_fragment, per_row)
+    identities = write_identities(lof, per_fragment, per_row, p1_max)
     print(f"\nwrote identities to {len(lof.id_images_file_paths)} files")
 
     # --- validation -------------------------------------------------------

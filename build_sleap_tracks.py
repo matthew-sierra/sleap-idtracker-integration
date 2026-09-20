@@ -43,12 +43,20 @@ Three cases, all left with ``track=None`` rather than guessed at:
    CENTROID_NODE was NaN. The instance is still written to the .slp with its
    keypoints intact; it just has no identity.
 2. identity 0 -- upstream's "unassigned" sentinel.
-3. A collision: two instances in one frame assigned the same identity. Crossing
-   rows are predicted independently with no mutual-exclusion pass, so this is
-   possible. BOTH are left untracked -- writing one of the two would invent a
-   resolution the evidence does not support. Counted and reported. This rule was
-   decided for the retired build_trajectories.py and carried over rather than
-   re-decided, so the two outputs never disagreed about an ambiguous frame.
+3. A collision the evidence cannot settle. Two instances in one frame can be
+   assigned the same identity -- crossing rows are predicted independently with
+   no mutual-exclusion pass -- and `drop_collisions` arbitrates: a single-image
+   fragment always loses to a longer competitor, otherwise the higher max(P1)
+   wins. Only when that cannot separate them (every claimant a crossing row with
+   no pooled vote, or an exact tie on max(P1)) are ALL claimants left untracked,
+   rather than resolving by write order. Counted and reported.
+
+   The original rule dropped BOTH claimants unconditionally, inherited from the
+   retired build_trajectories.py. It was replaced because it let a one-image
+   crossing fragment blank a 3459-image individual fragment (measured on
+   Pletcher_10fly, 1-based frame 16834, identity 1): both were discarded, so a
+   stray singleton cost the real track a frame. build_trajectories.py still
+   holds the old rule, so the two now disagree on contested frames by design.
 
 Run:
     /opt/anaconda3/envs/sleap_id/bin/python src/sleap_idtracker/build_sleap_tracks.py
@@ -81,7 +89,9 @@ def read_columns(out_dir: Path) -> dict[str, np.ndarray]:
     if not files:
         raise FileNotFoundError(f"no id_images_*.h5 in {out_dir}")
     cols: dict[str, list[np.ndarray]] = {
-        k: [] for k in ("frame_numbers", "instance_idx", "identities")}
+        k: [] for k in ("frame_numbers", "instance_idx", "identities",
+                        "fragment_identifier", "is_overlapping")}
+    p1: list[np.ndarray] = []
     for path in files:
         with h5py.File(path, "r") as fh:
             for name in cols:
@@ -89,24 +99,124 @@ def read_columns(out_dir: Path) -> dict[str, np.ndarray]:
                     raise KeyError(f"{path.name} has no {name!r}; "
                                    "run build_identities.py first")
                 cols[name].append(fh[name][...])
+            # Written by build_identities.py. Absent in sessions built before
+            # the collision tiebreak existed -- fall back to all-NaN, which
+            # makes every contest unresolvable and restores the old drop-both.
+            p1.append(fh["p1_max"][...] if "p1_max" in fh
+                      else np.full(len(fh["identities"]), np.nan))
             if fh.attrs.get("identities_source") is None:
                 raise KeyError(f"{path.name} has no identities_source attribute; "
                                "run build_identities.py first")
-    return {k: np.concatenate(v).astype(np.int64) for k, v in cols.items()}
+    out = {k: np.concatenate(v).astype(np.int64) for k, v in cols.items()
+           if k != "is_overlapping"}
+    out["is_overlapping"] = np.concatenate(cols["is_overlapping"]).astype(bool)
+    out["p1_max"] = np.concatenate(p1).astype(np.float64)
+    return out
 
 
-def drop_collisions(frame: np.ndarray, ident: np.ndarray) -> np.ndarray:
-    """Boolean mask of rows to apply. False where a (frame, identity) collides.
+def drop_collisions(frame: np.ndarray, ident: np.ndarray,
+                    frag_id: np.ndarray | None = None,
+                    p1_max: np.ndarray | None = None,
+                    overlapping: np.ndarray | None = None,
+                    stats: dict | None = None) -> np.ndarray:
+    """Boolean mask of rows to apply, resolving (frame, identity) contests.
 
-    A cell claimed more than once is claimed by nobody, rather than resolved by
-    write order. Inherited from the retired build_trajectories.py:112.
+    When two or more rows in one frame claim the same identity:
+
+    0. BOTH IN AN OVERLAPPING FRAGMENT -> BOTH [none]. If every claimant is an
+       `is_overlapping` row, all of them are left untracked. Set by explicit
+       instruction, and kept as its own rule rather than left to fall out of
+       step 2: it currently would, because those rows carry NaN p1_max and step
+       2 cannot pick a winner among NaNs, but that is a consequence of how
+       p1_max happens to be filled. If crossing rows ever gain a per-row
+       confidence the guarantee would vanish silently. This does not depend on
+       it.
+
+    1. LENGTH, but only against a ONE-IMAGE claimant. A claimant carrying a
+       single image of evidence loses to any competitor carrying more, with no
+       score compared. Two things count as one image:
+
+         - an `is_overlapping` row, whatever its fragment's length. Those rows
+           are different animals predicted one at a time with no pooling, so the
+           evidence behind any one row is exactly one network call. A five-row
+           crossing fragment is not five images of evidence for any one of its
+           identities.
+         - a row of an INDIVIDUAL fragment holding one image, which pooled a
+           single vote.
+
+       Skipped when every claimant is a one-image claimant, since then there is
+       no longer competitor to prefer.
+
+    2. max(P1). Among what survives step 1, the highest max(P1) wins -- the
+       fragment whose own images voted most decisively. P1 is normalised to sum
+       to 1, so it is comparable across fragments of different lengths.
+
+    Overlapping rows have no pooled vote and so no P1: they carry NaN and lose
+    to any competitor that has one. Every claimant is left untracked when step 0
+    applies, when no survivor has a finite max(P1), or when the maximum is tied
+    -- never resolved by write order.
+
+    Passing neither `frag_id` nor `p1_max` reproduces the old unconditional
+    drop-both behaviour, so sessions written before `p1_max` existed still load.
     """
     keep = ident > 0
-    cell = frame[keep] * (int(ident.max()) + 1) + ident[keep]
-    _, inverse, counts = np.unique(cell, return_inverse=True, return_counts=True)
-    ok = ~(counts > 1)[inverse]
+    rows = np.flatnonzero(keep)
     out = np.zeros(len(frame), dtype=bool)
-    out[np.flatnonzero(keep)] = ok
+    if rows.size == 0:
+        return out
+    cell = frame[rows] * (int(ident.max()) + 1) + ident[rows]
+    _, inverse, counts = np.unique(cell, return_inverse=True, return_counts=True)
+    contested = (counts > 1)[inverse]
+    out[rows[~contested]] = True                      # uncontested: keep
+
+    n_contest = n_both_ov = n_len = n_p1 = n_unres = 0
+    if contested.any():
+        legacy = frag_id is None or p1_max is None
+        if not legacy:
+            uf, cf = np.unique(frag_id, return_counts=True)
+            lookup = dict(zip(uf.tolist(), cf.tolist()))
+            size = np.array([lookup[int(f)] for f in frag_id[rows]], dtype=float)
+            score = p1_max[rows]
+            # Prefer the recorded flag; fall back to "has no pooled vote" for
+            # files written before build_overlaps.py added the column.
+            over = (np.asarray(overlapping, dtype=bool)[rows]
+                    if overlapping is not None else np.isnan(score))
+            eff = np.where(over, 1.0, size)
+        order = np.argsort(inverse, kind="stable")
+        bounds = np.flatnonzero(np.diff(inverse[order])) + 1
+        for grp in np.split(order, bounds):
+            if grp.size < 2:
+                continue
+            n_contest += 1
+            if legacy:
+                n_unres += 1
+                continue
+            if over[grp].all():                        # step 0
+                n_both_ov += 1
+                continue
+            cand = grp
+            if eff[grp].max() > 1:                     # step 1
+                cand = grp[eff[grp] > 1]
+            if cand.size == 1:
+                out[rows[cand[0]]] = True
+                n_len += 1
+                continue
+            sc = score[cand]                           # step 2
+            fin = np.isfinite(sc)
+            if not fin.any():
+                n_unres += 1
+                continue
+            best = sc[fin].max()
+            top = cand[fin][sc[fin] == best]
+            if top.size == 1:
+                out[rows[top[0]]] = True
+                n_p1 += 1
+            else:
+                n_unres += 1
+    if stats is not None:
+        stats.update(n_contested_cells=n_contest, n_all_overlapping=n_both_ov,
+                     n_resolved_by_length=n_len, n_resolved_by_p1=n_p1,
+                     n_unresolved=n_unres)
     return out
 
 
@@ -117,11 +227,54 @@ def apply_tracks(labels, cols: dict[str, np.ndarray], n_animals: int) -> dict:
     if ident.size and ident.max() > n_animals:
         raise ValueError(f"identity {int(ident.max())} exceeds n_animals={n_animals}")
 
+    # CLEAR ANY IDENTITY THE INPUT ALREADY CARRIES, before installing ours.
+    #
+    # Not defensive tidying -- required. The line below REPLACES labels.tracks,
+    # but an instance holds its own reference to a Track object, and every
+    # instance this stage does not re-point keeps pointing at one of the old
+    # ones. Those objects are then reachable from the frames and absent from
+    # labels.tracks, and sleap-io's writer resolves each instance's track by
+    # `labels.tracks.index(inst.track)` (slp.py:1784), so it dies with
+    #     ValueError: Track(name='...') is not in list
+    # the moment one such instance is written. MEASURED on this input: the
+    # corrected oline .slp carries 581 SLEAP tracks on 529048 instances.
+    #
+    # Clearing here rather than in a per-dataset preparation script means the
+    # guarantee holds for ANY input: the port derives identity from scratch, and
+    # the output declares exactly the n_animals tracks this function created --
+    # which is what the validation in main() already asserts ("file declares
+    # n_animals tracks", "no frame has two instances on one track"). The
+    # contract was always this; it is now enforced rather than assumed.
+    n_pre_existing = sum(1 for lf in labels.labeled_frames
+                         for i in lf.instances if i.track is not None)
+    if n_pre_existing:
+        print(f"  input carries identity already: {n_pre_existing} instance(s) "
+              f"on {len(labels.tracks)} track(s) -- cleared, since identity here "
+              "is derived from scratch")
+        # `pi`, NOT `inst`: this function unpacked `inst = cols["instance_idx"]`
+        # at the top, and a loop variable named `inst` would leave that name
+        # bound to the last PredictedInstance for the rest of the function --
+        # which then fails in the assignment loop below with
+        #   IndexError: Invalid indexing argument for skeleton: 0
+        # because `inst[row]` indexes an instance by node instead of an array by
+        # position. Caught in preflight; the name is deliberate.
+        for lf in labels.labeled_frames:
+            for pi in lf.instances:
+                pi.track = None
+
     tracks = [Track(name=str(i + 1)) for i in range(n_animals)]
     labels.tracks = tracks
 
     by_frame = {lf.frame_idx: lf for lf in labels.labeled_frames}
-    keep = drop_collisions(frame, ident)
+    coll: dict = {}
+    keep = drop_collisions(frame, ident, cols.get("fragment_identifier"),
+                           cols.get("p1_max"), cols.get("is_overlapping"), coll)
+    if coll.get("n_contested_cells"):
+        print(f"  collisions: {coll['n_contested_cells']} contested (frame, identity) "
+              f"cells -> {coll['n_all_overlapping']} all-overlapping (untracked), "
+              f"{coll['n_resolved_by_length']} settled on length, "
+              f"{coll['n_resolved_by_p1']} on max(P1), "
+              f"{coll['n_unresolved']} otherwise untracked")
 
     n_set = 0
     for row in np.flatnonzero(keep):
@@ -192,7 +345,9 @@ def main(slp_path: Path = SLP, out_dir: Path = OUT_DIR,
 
     # Rebuild the expected identity of every instance straight from the HDF5,
     # then compare against what actually round-tripped through the file.
-    keep = drop_collisions(cols["frame_numbers"], cols["identities"])
+    keep = drop_collisions(cols["frame_numbers"], cols["identities"],
+                           cols.get("fragment_identifier"), cols.get("p1_max"),
+                           cols.get("is_overlapping"))
     expected: dict[tuple[int, int], str] = {
         (int(cols["frame_numbers"][r]), int(cols["instance_idx"][r])):
             str(int(cols["identities"][r]))
